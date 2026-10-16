@@ -24,7 +24,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from shapr3d_mcp import kernel
+from shapr3d_mcp import kernel, macos
 
 # build123d logs verbosely at INFO; anything reaching stdout would corrupt
 # the MCP stdio transport, so clamp it before the kernel is imported.
@@ -40,6 +40,9 @@ mcp = FastMCP(
         "Typical flow: create_model / run_model_file -> open_in_shapr3d -> user edits in app -> "
         "user exports STEP -> diff_models / modify_model. Call "
         "build123d_guide first if you are unsure of build123d syntax. "
+        "On macOS, call check_permissions once before using the Shapr3D UI "
+        "tools (read_shapr3d_ui, click_shapr3d_text, shapr3d_menu, "
+        "export_from_shapr3d...); they briefly take focus, so batch them. "
         "After each meaningful model change, call quick_look and show the "
         "PNG to the user - they only see images you send them. Modeling, "
         "checks and renders run in the CAD kernel and never need the "
@@ -586,6 +589,7 @@ def _activate_app() -> None:
             ["open", "-a", APP_NAME], check=True, timeout=15,
             stdin=subprocess.DEVNULL,
         )
+
 
 def _shapr3d_history_mentions(needle: str) -> bool:
     """Check Shapr3D's own accessibility tree for a History entry containing
@@ -1475,8 +1479,8 @@ def activate_shapr3d() -> str:
 def screenshot_shapr3d() -> Image:
     """Capture a screenshot of the Shapr3D window to see the current state
     of the model/app. On macOS, requires Screen Recording permission for the
-    host process the first time and captures the window's screen region,
-    so keep it uncovered. On Windows, captures the window even when other
+    host process the first time; captures the window even when covered and
+    scales it to window points (pixel coords = click_shapr3d_at coords). On Windows, captures the window even when other
     windows cover it, but not when it is minimized."""
     if not _app_running():
         raise RuntimeError("Shapr3D is not running. Call activate_shapr3d first.")
@@ -1493,6 +1497,13 @@ def screenshot_shapr3d() -> Image:
         _win_capture_window(hwnd, out)
         return Image(path=str(out))
     try:
+        # by window id: works when other windows cover Shapr3D, and is
+        # scaled to window points so pixels map 1:1 to click_shapr3d_at
+        macos.capture(out)
+        return Image(path=str(out))
+    except Exception:
+        pass
+    try:
         bounds = _osascript(
             f'tell application "System Events" to tell process "{APP_NAME}" to '
             "get {position, size} of front window"
@@ -1506,6 +1517,216 @@ def screenshot_shapr3d() -> Image:
         stdin=subprocess.DEVNULL,
     )
     return Image(path=str(out))
+
+
+def _require_running() -> None:
+    """UI automation (OCR, clicks, menus, keys, Save panel) is macOS-only."""
+    if sys.platform != "darwin":
+        raise RuntimeError(
+            "This Shapr3D UI tool is macOS-only (it uses Accessibility, "
+            "Vision OCR and System Events). Model tools work everywhere."
+        )
+    if not macos.is_running():
+        raise RuntimeError("Shapr3D is not running. Call activate_shapr3d first.")
+
+
+@mcp.tool()
+def read_shapr3d_ui(contains: str | None = None) -> dict:
+    """OCR the Shapr3D window: every visible text label with its centre in
+    window points (x, y; same frame as screenshot_shapr3d). Use it to find
+    buttons, dialog options and tool names before clicking.
+
+    Args:
+        contains: Optional case-insensitive filter on the label text.
+    """
+    _require_running()
+    win, items = macos.read_ui(WORKDIR / "_shapr3d_ui.png")
+    if contains:
+        items = [i for i in items if contains.lower() in i["text"].lower()]
+    return {
+        "window_points": [win["w"], win["h"]],
+        "labels": [{k: i[k] for k in ("text", "x", "y")} for i in items],
+    }
+
+
+@mcp.tool()
+def click_shapr3d_text(text: str, occurrence: int = 1, wait_s: float = 0) -> dict:
+    """Click a visible text label in Shapr3D (button, dialog option, tool or
+    list item), located by OCR. Exact matches beat substring matches;
+    `occurrence` picks the n-th match top-to-bottom. `wait_s` keeps looking
+    for the label that long (e.g. for a dialog that is still opening).
+    Brings Shapr3D to the front."""
+    _require_running()
+    deadline = time.monotonic() + wait_s
+    shot = WORKDIR / "_shapr3d_ui.png"
+    while True:
+        _, items = macos.read_ui(shot)
+        hit = macos.match_text(text, items, occurrence)
+        if hit or time.monotonic() >= deadline:
+            break
+        time.sleep(0.8)
+    if not hit:
+        seen = sorted({i["text"] for i in items})[:60]
+        raise RuntimeError(f"'{text}' not found on screen. Visible labels: {seen}")
+    macos.activate()
+    macos.click_screen(hit["screen_x"], hit["screen_y"])
+    return {"clicked": hit["text"], "at_window_points": [hit["x"], hit["y"]]}
+
+
+@mcp.tool()
+def click_shapr3d_at(x: float, y: float) -> dict:
+    """Click at window coordinates in points (the pixel coordinates of a
+    screenshot_shapr3d image) - for icons without a text label. Brings
+    Shapr3D to the front."""
+    _require_running()
+    win = macos.window()
+    if not (0 <= x <= win["w"] and 0 <= y <= win["h"]):
+        raise ValueError(f"({x}, {y}) is outside the {win['w']}x{win['h']} window")
+    macos.activate()
+    macos.click_screen(win["x"] + x, win["y"] + y)
+    return {"clicked_window_points": [x, y]}
+
+
+@mcp.tool()
+def shapr3d_menu(path: list[str] | None = None, click: bool = True) -> dict:
+    """Use Shapr3D's menu bar, e.g. ["File", "Export to", "STEP…"] or
+    ["Edit", "Undo"]. Menu names must match exactly (note the "…"
+    ellipsis character). With click=False, or a path ending at a menu,
+    lists the items under that path instead (empty path = top menus)."""
+    _require_running()
+    path = path or []
+    if click and path:
+        try:
+            macos.activate()
+            macos.menu(path)
+            return {"clicked": path}
+        except RuntimeError as err:
+            if "Can't get" not in str(err) and "Invalid index" not in str(err):
+                raise
+            # fall through: show what exists at the deepest valid level
+    for depth in range(len(path), -1, -1):
+        try:
+            return {"path": path[:depth], "items": macos.menu_items(path[:depth]),
+                    **({"error": f"'{path[depth]}' not found here"} if depth < len(path) else {})}
+        except RuntimeError:
+            continue
+    raise RuntimeError("Could not read the Shapr3D menu bar.")
+
+
+@mcp.tool()
+def shapr3d_keys(combo: str | None = None, text: str | None = None) -> dict:
+    """Send a keyboard shortcut to Shapr3D ("cmd+z", "escape", "return",
+    "cmd+shift+s", "delete") and/or type text (e.g. a value into a focused
+    field). Brings Shapr3D to the front."""
+    _require_running()
+    if not combo and text is None:
+        raise ValueError("Give a combo, text, or both")
+    parsed = macos.parse_keys(combo) if combo else None  # validate first
+    macos.activate()
+    if text is not None:
+        macos.type_text(text)
+    if combo:
+        macos.keys(combo)
+    return {"sent": combo, "typed": text, "parsed": parsed}
+
+
+EXPORT_MENU = {
+    "step": "STEP…", "stl": "STL…", "3mf": "3MF…", "iges": "IGES…",
+    "glb": "GLB…", "obj": "OBJ…", "usdz": "USDZ…", "x_t": "Parasolid file…",
+    "shapr": "Shapr3D…",
+}
+EXPORT_EXT = {"x_t": "x_t", "iges": "igs"}
+
+
+@mcp.tool()
+def export_from_shapr3d(name: str, fmt: str = "step", folder: str | None = None,
+                        timeout_s: float = 15) -> dict:
+    """Export the open Shapr3D project (File > Export to > <format>) and save
+    it, so you can inspect / diff / modify what the user built or changed in
+    the app. Shapr3D takes focus for ~3 s while the Save panel is filled in,
+    then focus returns to the previously active app.
+
+    Args:
+        name: File name without extension.
+        fmt: step (default), stl, 3mf, iges, glb, obj, usdz, x_t, shapr.
+        folder: Target folder; default the models workspace.
+    Returns the saved path (extension added if Shapr3D left it off) and,
+    for CAD formats, inspect_model's summary.
+    """
+    _require_running()
+    fmt = fmt.lower().lstrip(".")
+    if fmt not in EXPORT_MENU:
+        raise ValueError(f"fmt must be one of {sorted(EXPORT_MENU)}")
+    dest = Path(folder).expanduser() if folder else WORKDIR
+    dest.mkdir(parents=True, exist_ok=True)
+    safe = _safe_name(name)
+    ext = EXPORT_EXT.get(fmt, fmt)
+    before = {p for p in dest.iterdir()} if dest.exists() else set()
+    previous = macos.frontmost_app()
+    macos.menu(["File", "Export to", EXPORT_MENU[fmt]])
+    if not macos.wait_for_save_dialog(timeout_s):
+        _, items = macos.read_ui(WORKDIR / "_shapr3d_ui.png")
+        raise RuntimeError(
+            "No Save dialog appeared (Shapr3D may show export options first, "
+            "or be in a mode that blocks export). Visible labels: "
+            f"{sorted({i['text'] for i in items})[:40]}"
+        )
+    try:
+        macos.activate()
+        macos.fill_save_dialog(safe, str(dest))
+    finally:
+        if previous and previous != APP_NAME:
+            macos.activate_app(previous)
+    deadline = time.monotonic() + 30
+    saved = None
+    while time.monotonic() < deadline and saved is None:
+        for cand in (dest / f"{safe}.{ext}", dest / safe):
+            if cand.exists() and cand not in before and cand.stat().st_size > 0:
+                saved = cand
+                break
+        else:
+            time.sleep(0.5)
+    if saved is None:
+        raise RuntimeError(f"Export did not appear in {dest} within 30 s")
+    if saved.suffix.lower() != f".{ext}":
+        final = saved.with_name(f"{safe}.{ext}")
+        saved.rename(final)  # Shapr3D omits the extension when typed by name
+        saved = final
+    out = {"saved": str(saved), "focus_returned_to": previous}
+    if fmt in {"step", "stl", "3mf", "iges"}:
+        info = inspect_model(str(saved))
+        out["summary"] = {k: info[k] for k in ("solids", "volume_mm3", "bounding_box_mm") if k in info}
+    return out
+
+
+@mcp.tool()
+def check_permissions(prompt: bool = True) -> dict:
+    """Warm-up: check (and with prompt=True, request) every macOS permission
+    the Shapr3D UI tools need - Accessibility, Screen Recording, control of
+    System Events - so the user approves them once at the start instead of
+    mid-task. Model tools (create/inspect/clash/render...) need none.
+
+    Claude's own per-tool approvals are separate: one allow rule
+    "mcp__shapr3d" in Claude's settings covers all tools of this server.
+    """
+    if sys.platform != "darwin":
+        return {"ready": True, "note": "No macOS permissions to request on this platform."}
+    status = macos.permissions(prompt)
+    missing = [k for k in ("accessibility", "screen_recording", "automation_system_events")
+               if not status.get(k)]
+    status["shapr3d_running"] = macos.is_running()
+    status["ready"] = not missing
+    if missing:
+        status["todo"] = (
+            f"Grant {', '.join(missing)} to the app hosting this server "
+            "(System Settings > Privacy & Security), then restart it. "
+            "Screen Recording changes only apply after a restart."
+        )
+    status["claude_tool_approvals"] = (
+        "Allow rule 'mcp__shapr3d' (Claude settings, permissions.allow) "
+        "pre-approves every tool of this server."
+    )
+    return status
 
 
 # ---------------------------------------------------------------------------

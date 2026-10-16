@@ -27,6 +27,11 @@ AI assistant ──MCP──▶ this server ──build123d/OCCT──▶ model.
 
 ## Tools
 
+The macOS UI tools need Screen Recording and Accessibility permission for the
+app hosting the server; Shapr3D draws its own dialogs, so they are found by
+OCR, and it ignores input while in the background, so these tools bring it
+forward briefly. Run `check_permissions` once at the start.
+
 | Tool | Purpose |
 |---|---|
 | `create_model` | Build a model from a build123d script (optionally fed by a shared `params_file`), export STEP/STL/3MF/glTF/GLB/BREP |
@@ -44,6 +49,12 @@ AI assistant ──MCP──▶ this server ──build123d/OCCT──▶ model.
 | `open_in_shapr3d` | Open a file in Shapr3D (STEP imports as editable bodies) |
 | `activate_shapr3d` / `shapr3d_status` | Launch / check the app |
 | `screenshot_shapr3d` | Capture the Shapr3D window |
+| `read_shapr3d_ui` | macOS: OCR the window - visible labels with their positions |
+| `click_shapr3d_text` / `click_shapr3d_at` | macOS: click a label found by OCR, or a point from a screenshot |
+| `shapr3d_menu` | macOS: click or list menu-bar items, e.g. `["File", "Export to", "STEP…"]` |
+| `shapr3d_keys` | macOS: send a shortcut (`cmd+z`, `escape`) or type text |
+| `export_from_shapr3d` | macOS: File > Export to > STEP/STL/... and fill the Save panel; focus returns to the previous app |
+| `check_permissions` | macOS: warm-up - request Accessibility / Screen Recording / Automation once, report status |
 | `build123d_guide` | Modeling syntax cheat sheet for the AI |
 
 ## Setup
