@@ -517,16 +517,62 @@ def convert_model(path: str, formats: list[str], output_name: str | None = None)
     return {"files": _export(shape, base, formats)}
 
 
+VIEW_PRESETS = {
+    # (elevation, azimuth) in degrees, matplotlib convention.
+    "iso": (30, -60),
+    "front": (0, -90),   # looking along +Y
+    "back": (0, 90),
+    "right": (0, 0),     # looking along -X
+    "left": (0, 180),
+    "top": (90, -90),    # looking down -Z
+    "bottom": (-90, -90),
+}
+
+
 @mcp.tool()
-def render_preview(path: str, width: int = 800, height: int = 600) -> Image:
-    """Render an isometric PNG preview of a CAD file (STEP/IGES/STL/BREP/3MF)
-    without opening Shapr3D. Useful to visually verify a model you just
-    created before sending it to the app."""
+def render_preview(path: str, width: int = 800, height: int = 600,
+                   views: list[str] | None = None,
+                   elevation: float | None = None,
+                   azimuth: float | None = None,
+                   edges: bool = False) -> Image:
+    """Render a PNG preview of a CAD file (STEP/IGES/STL/BREP/3MF) without
+    opening Shapr3D. Useful to visually verify a model you just created
+    before sending it to the app.
+
+    Args:
+        views: One or more of iso, front, back, left, right, top, bottom,
+            or ["all"] for an iso/front/top/right grid. Default ["iso"].
+            Standard views (not iso) use orthographic projection.
+        elevation, azimuth: Custom camera angles in degrees; override
+            `views` with a single custom view.
+        edges: Overlay B-rep edges as dark lines (drawn through the part,
+            like a wireframe, so hidden edges also show).
+    """
     src = _resolve(path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
     shape = _import_any(src)
+    if elevation is not None or azimuth is not None:
+        cams = [("custom", elevation if elevation is not None else 30,
+                 azimuth if azimuth is not None else -60, False)]
+    else:
+        names = views or ["iso"]
+        if names == ["all"]:
+            names = ["iso", "front", "top", "right"]
+        unknown = [v for v in names if v not in VIEW_PRESETS]
+        if unknown:
+            raise ValueError(
+                f"Unknown view(s) {unknown}; choose from "
+                f"{sorted(VIEW_PRESETS)} or 'all'."
+            )
+        cams = [(v, *VIEW_PRESETS[v], v != "iso") for v in names]
+    out = WORKDIR / (_safe_name(src.stem) + "_preview.png")
+    _render_png(shape, out, cams, width, height, edges)
+    return Image(path=str(out))
 
+
+def _render_png(shape, out: Path, cams: list[tuple], width: int, height: int,
+                edges: bool) -> None:
     # Render via STL -> matplotlib (no GPU/display needed)
     import numpy as np
 
@@ -539,31 +585,61 @@ def render_preview(path: str, width: int = 800, height: int = 600) -> Image:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
 
-    fig = plt.figure(figsize=(width / 100, height / 100), dpi=100)
-    ax = fig.add_subplot(111, projection="3d")
-    light = np.array([0.4, 0.3, 0.85])
-    light = light / np.linalg.norm(light)
-    shade = 0.35 + 0.65 * np.clip(normals @ light, 0, 1)
-    colors = np.outer(shade, np.array([0.35, 0.55, 0.85]))
-    # Stroke each triangle in its own colour: with edgecolor="none" the
-    # antialiased gaps between triangles show up as light seams.
-    coll = Poly3DCollection(
-        tris, facecolors=colors, edgecolors=colors, linewidths=0.4
-    )
-    ax.add_collection3d(coll)
+    edge_lines = []
+    if edges:
+        all_edges = shape.edges()
+        if len(all_edges) <= 5000:  # meshes (STL) have one edge per triangle side
+            for e in all_edges:
+                n = 2 if e.geom_type.name == "LINE" else 24
+                pts = [e.position_at(i / (n - 1)) for i in range(n)]
+                xyz = [(p.X, p.Y, p.Z) for p in pts]
+                # Line3DCollection needs equal-length segments: use pairs.
+                edge_lines.extend(zip(xyz[:-1], xyz[1:]))
+
     lo, hi = tris.reshape(-1, 3).min(axis=0), tris.reshape(-1, 3).max(axis=0)
     center, span = (lo + hi) / 2, (hi - lo).max() / 2 or 1
-    ax.set_xlim(center[0] - span, center[0] + span)
-    ax.set_ylim(center[1] - span, center[1] + span)
-    ax.set_zlim(center[2] - span, center[2] + span)
-    ax.set_axis_off()
-    ax.view_init(elev=30, azim=-60)
-    out = WORKDIR / (_safe_name(src.stem) + "_preview.png")
+    size = hi - lo
+
+    cols = 1 if len(cams) == 1 else 2
+    rows = (len(cams) + cols - 1) // cols
+    fig = plt.figure(figsize=(width / 100, height / 100), dpi=100)
+    for i, (label, elev, azim, ortho) in enumerate(cams):
+        ax = fig.add_subplot(rows, cols, i + 1, projection="3d")
+        if ortho:
+            ax.set_proj_type("ortho")
+        # Headlight from the camera, nudged up-left so faces square to the
+        # view still differ from their neighbours.
+        e, a = np.radians(elev), np.radians(azim)
+        cam = np.array([np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e)])
+        light = cam + 0.35 * np.array([-np.sin(a), np.cos(a), 0.6])
+        light = light / np.linalg.norm(light)
+        shade = 0.3 + 0.7 * np.clip(normals @ light, 0, 1)
+        colors = np.outer(shade, np.array([0.35, 0.55, 0.85]))
+        # Stroke each triangle in its own colour: with edgecolor="none" the
+        # antialiased gaps between triangles show up as light seams.
+        coll = Poly3DCollection(
+            tris, facecolors=colors, edgecolors=colors, linewidths=0.4
+        )
+        ax.add_collection3d(coll)
+        if edge_lines:
+            ax.add_collection3d(
+                Line3DCollection(edge_lines, colors="#111111", linewidths=0.6)
+            )
+        ax.set_xlim(center[0] - span, center[0] + span)
+        ax.set_ylim(center[1] - span, center[1] + span)
+        ax.set_zlim(center[2] - span, center[2] + span)
+        ax.set_axis_off()
+        ax.view_init(elev=elev, azim=azim)
+        if len(cams) > 1 or label != "iso":
+            ax.set_title(label, fontsize=9)
+    fig.suptitle(
+        f"{size[0]:.1f} x {size[1]:.1f} x {size[2]:.1f} mm (X x Y x Z)",
+        fontsize=8, y=0.02, va="bottom",
+    )
     fig.savefig(out, bbox_inches="tight", pad_inches=0.05)
     plt.close(fig)
-    return Image(path=str(out))
 
 
 def _read_binary_stl(path: Path):
