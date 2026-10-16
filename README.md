@@ -34,8 +34,12 @@ hosts the MCP server (Shapr3D draws its own dialogs, so they are found by OCR).
 |---|---|
 | `create_model` | Build a model from a build123d script (optionally fed by a shared `params_file`), export STEP/STL/3MF/glTF/GLB/BREP |
 | `modify_model` | Import an existing file (e.g. Shapr3D STEP export), edit it in code, re-export |
-| `detect_clash` | Pairwise interference check between solids (assembly/keep-out verification) |
-| `inspect_model` | Solids, bounding box, volume, face/edge counts of a STEP/IGES/STL/BREP/3MF file |
+| `run_model_file` | Build from a script file (versionable), with `load_cad` (cached vendor CAD), `include`, `export_part`, checked `cut`/`fuse` |
+| `detect_clash` | Pairwise interference check; names assembly parts, separates `expected` overlaps (threads, hoses), reports `near_miss_mm` gaps |
+| `query_features` | Cylinders (hole/boss, radius, axis, length) and planes of a part or region - read real dimensions off vendor CAD |
+| `section_view` | 2-D cross-section PNG on XY/XZ/YZ, parts coloured, areas listed |
+| `diff_models` | What changed between two versions (e.g. after the user edited in Shapr3D): added/removed regions, new/removed faces |
+| `inspect_model` | Solids, bounding box, volume, face/edge counts; per-part inventory for labelled assemblies |
 | `convert_model` | Read STEP / IGES / STL / BREP / 3MF, write STEP / STL / 3MF / glTF / GLB / BREP |
 | `render_preview` | Shaded PNG preview (iso / standard views / custom angle, optional edge overlay) without opening any app |
 | `list_models` | List files in the models workspace |

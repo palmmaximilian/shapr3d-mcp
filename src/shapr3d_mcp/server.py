@@ -11,6 +11,7 @@ Shapr3D has no public API, so this server pairs a real CAD kernel
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -23,7 +24,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from shapr3d_mcp import macos
+from shapr3d_mcp import kernel, macos
 
 # build123d logs verbosely at INFO; anything reaching stdout would corrupt
 # the MCP stdio transport, so clamp it before the kernel is imported.
@@ -155,18 +156,68 @@ def _shape_stats(shape) -> dict:
     return stats
 
 
-def _run_script(script: str, extra_globals: dict | None = None):
-    """Execute a build123d script and return the object bound to `result`."""
+CACHE_DIR = WORKDIR / ".cache"
+
+
+def _script_env(ctx: dict, base_dir: Path) -> dict:
+    """Globals for model scripts: build123d, math, and the helpers
+    cut / fuse / load_cad / include / export_part (see build123d_guide)."""
     import build123d as b3d
 
     env: dict = {"__builtins__": __builtins__}
     env.update({k: getattr(b3d, k) for k in dir(b3d) if not k.startswith("_")})
     env["math"] = __import__("math")
+    env["cut"] = kernel.make_cut(ctx["warnings"])
+    env["fuse"] = kernel.make_fuse(ctx["warnings"])
+
+    def resolve_here(path: str) -> Path:
+        p = Path(path).expanduser()
+        if p.is_absolute():
+            return p
+        return (base_dir / p) if (base_dir / p).exists() else WORKDIR / p
+
+    def load_cad(path: str, cache: bool = True):
+        """Import a CAD file (STEP/IGES cached as BREP for fast reloads)."""
+        src = resolve_here(path)
+        if not src.exists():
+            raise FileNotFoundError(f"No such file: {src}")
+        return kernel.load_cad(src, _import_any, CACHE_DIR, cache)
+
+    def include(path: str) -> None:
+        """Run another script file in this same namespace."""
+        src = resolve_here(path)
+        exec(compile(src.read_text(), str(src), "exec"), env)
+
+    def export_part(shape, name: str, formats: list[str] | None = None) -> list[str]:
+        """Export an extra file (e.g. one print part) next to the result."""
+        files = _export(shape, WORKDIR / _safe_name(name), formats or ["step"])
+        ctx["files"].extend(files)
+        return files
+
+    env.update(load_cad=load_cad, include=include, export_part=export_part)
+    return env
+
+
+def _run_script(script: str, extra_globals: dict | None = None,
+                ctx: dict | None = None, filename: str = "<model_script>",
+                base_dir: Path | None = None):
+    """Execute a build123d script and return the object bound to `result`.
+    `ctx` collects boolean warnings and files written by export_part."""
+    import build123d as b3d
+
+    ctx = ctx if ctx is not None else {"warnings": [], "files": []}
+    env = _script_env(ctx, base_dir or WORKDIR)
     if extra_globals:
         env.update(extra_globals)
 
+    # stdout is the MCP stdio transport: script print()s go to stderr, and
+    # OCCT readers a script calls itself (import_step) are clamped too.
+    _quiet_occt()
     try:
-        exec(compile(script, "<model_script>", "exec"), env)
+        with contextlib.redirect_stdout(sys.stderr):
+            exec(compile(script, filename, "exec"), env)
+    except kernel.BooleanError as err:
+        raise RuntimeError(f"Boolean check failed: {err}") from None
     except Exception:
         raise RuntimeError(
             "Script raised an exception:\n" + traceback.format_exc(limit=4)
@@ -306,12 +357,7 @@ def _collect_solids(paths: list[Path]) -> list[dict]:
     """Import files and flatten to a list of {ref, solid} entries."""
     entries: list[dict] = []
     for path in paths:
-        shape = _import_any(path)
-        solids = shape.solids()
-        for i, s in enumerate(solids):
-            label = getattr(s, "label", "") or None
-            ref = f"{path.name}#{i}" + (f" ({label})" if label else "")
-            entries.append({"ref": ref, "solid": s})
+        entries.extend(kernel.labelled_solids(_import_any(path), path.name))
     return entries
 
 
@@ -355,14 +401,54 @@ def create_model(name: str, script: str, formats: list[str] | None = None,
             hardcoding them, e.g. `wall = params["enclosure"]["wall"]`.
     """
     extra = {"params": _load_params(params_file)} if params_file else None
-    shape = _run_script(script, extra)
+    ctx = {"warnings": [], "files": []}
+    shape = _run_script(script, extra, ctx)
     base = WORKDIR / _safe_name(name)
     files = _export(shape, base, formats or ["step"])
-    return {
-        "files": files,
-        "stats": _shape_stats(shape),
-        "next_step": "Use open_in_shapr3d to load the STEP file into Shapr3D.",
-    }
+    return _build_report(shape, ctx["files"] + files, ctx["warnings"])
+
+
+def _build_report(shape, files: list[str], warnings: list[str]) -> dict:
+    out = {"files": files, "stats": _shape_stats(shape)}
+    parts = kernel.part_inventory(shape)
+    if parts:
+        out["parts"] = parts
+    if warnings:
+        out["boolean_warnings"] = warnings
+    out["next_step"] = "Use open_in_shapr3d to load the STEP file into Shapr3D."
+    return out
+
+
+@mcp.tool()
+def run_model_file(script_path: str, name: str, formats: list[str] | None = None,
+                   params_file: str | None = None) -> dict:
+    """Build a model from a script FILE (version it like code) instead of an
+    inline script. Relative paths resolve against the models workspace.
+
+    Besides build123d, scripts get these helpers:
+        load_cad(path)          import STEP/IGES/STL/BREP/3MF (vendor STEP is
+                                cached as BREP, so re-runs are fast)
+        include(path)           run another script in the same namespace
+                                (e.g. a part script inside an assembly script)
+        export_part(shape, name, formats)  write extra files (print parts)
+        cut(a, *tools) / fuse(a, *tools)   booleans checked against the
+                                actual overlap - raise instead of silently
+                                doing nothing
+        params                  the params_file mapping, if given
+    Give assembly children a `label` (and optionally `color`) - the report
+    lists them as parts, and detect_clash names clashes after them.
+    """
+    src = _resolve(script_path)
+    if not src.exists():
+        raise FileNotFoundError(f"No such file: {src}")
+    extra = {"__file__": str(src)}
+    if params_file:
+        extra["params"] = _load_params(params_file)
+    ctx = {"warnings": [], "files": []}
+    shape = _run_script(src.read_text(), extra, ctx, filename=str(src),
+                        base_dir=src.parent)
+    files = _export(shape, WORKDIR / _safe_name(name), formats or ["step"])
+    return _build_report(shape, ctx["files"] + files, ctx["warnings"])
 
 
 @mcp.tool()
@@ -394,11 +480,15 @@ def modify_model(input_path: str, script: str, output_name: str | None = None,
     extra: dict = {"imported": imported}
     if params_file:
         extra["params"] = _load_params(params_file)
-    shape = _run_script(script, extra)
+    ctx = {"warnings": [], "files": []}
+    shape = _run_script(script, extra, ctx)
     base = _output_base(src, output_name, src.stem + "_modified",
                         formats or ["step"])
     files = _export(shape, base, formats or ["step"])
-    return {"files": files, "stats": _shape_stats(shape)}
+    out = {"files": ctx["files"] + files, "stats": _shape_stats(shape)}
+    if ctx["warnings"]:
+        out["boolean_warnings"] = ctx["warnings"]
+    return out
 
 
 @mcp.tool()
@@ -426,15 +516,22 @@ def inspect_model(path: str) -> dict:
         info["solids_detail"] = per_solid
     except Exception:
         pass
+    parts = kernel.part_inventory(shape)
+    if parts:
+        info["parts"] = parts
+        info.pop("solids_detail", None)  # parts is the readable view
     return info
 
 
 @mcp.tool()
-def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001) -> dict:
+def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001,
+                 expected: list[str] | None = None,
+                 near_miss_mm: float = 0.0) -> dict:
     """Check solids for interference (clash) by pairwise boolean intersection.
 
     Pass one file (all solids in it are checked against each other — e.g. an
     assembly compound) or several files (solids are pooled across them).
+    Assembly children with labels are reported by name ("Screws#2").
     Reference geometry like keep-out volumes can be modeled as solids and
     clash-checked against real parts to enforce interface contracts.
 
@@ -443,11 +540,17 @@ def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001) -> dict:
             resolve against the models workspace.
         min_overlap_mm3: Overlap volume below this is ignored (numeric noise
             from coincident faces). Default 0.001 mm^3.
+        expected: Intended overlaps, reported separately and not counted
+            against `clear` - e.g. threads modelled at nominal size in a
+            pilot hole or hoses pushed into fittings. Each entry is
+            "A|B" (pair whose refs contain A and B) or "A" (any pair
+            involving A); case-insensitive substrings.
+        near_miss_mm: Also report non-overlapping pairs closer than this
+            (min distance), e.g. 1.0 to find tight clearances.
 
     Returns:
-        clear: True if no pair overlaps; clashes: list of overlapping pairs
-        with their overlap volume and bounding box, so the offending region
-        can be located.
+        clear: True if no unexpected pair overlaps; clashes / expected
+        overlaps with volume and bounding box; near_misses with gap_mm.
     """
     resolved = []
     for p in paths:
@@ -461,24 +564,30 @@ def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001) -> dict:
             f"Need at least 2 solids to clash-check, found {len(entries)}. "
             "IGES files transfer as surfaces (no solids); convert to STEP."
         )
-    clashes = []
-    check_errors = []
+    expected = expected or []
+    clashes, intended, near, check_errors = [], [], [], []
     pairs = 0
     for i in range(len(entries)):
         for j in range(i + 1, len(entries)):
-            pairs += 1
             a, b = entries[i], entries[j]
-            # Cheap reject: bounding boxes that don't intersect can't clash.
-            ba, bb = a["solid"].bounding_box(), b["solid"].bounding_box()
-            if (ba.min.X > bb.max.X or bb.min.X > ba.max.X or
-                    ba.min.Y > bb.max.Y or bb.min.Y > ba.max.Y or
-                    ba.min.Z > bb.max.Z or bb.min.Z > ba.max.Z):
+            if a["part"] == b["part"] and len(paths) == 1 and a["part"] != resolved[0].name:
+                # solids of one assembly part (e.g. a vendor sub-assembly)
+                # are not clash-checked against each other
+                continue
+            pairs += 1
+            gap_bb = kernel.bbox_gap(a["solid"], b["solid"])
+            if gap_bb > 0:
+                # Cheap reject: bounding boxes that don't intersect can't clash.
+                if near_miss_mm and gap_bb < near_miss_mm:
+                    gap = a["solid"].distance_to(b["solid"])
+                    if gap < near_miss_mm:
+                        near.append({"a": a["ref"], "b": b["ref"], "gap_mm": round(gap, 3)})
                 continue
             # A failed boolean must NOT read as "no clash" - record it so the
             # caller knows the check was incomplete.
             try:
                 overlap = a["solid"].intersect(b["solid"])
-                vol = (getattr(overlap, "volume", 0.0) or 0.0) if overlap else 0.0
+                vol = kernel._vol(overlap)
             except Exception as exc:
                 check_errors.append(
                     {"a": a["ref"], "b": b["ref"], "error": str(exc)[:200]}
@@ -491,7 +600,9 @@ def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001) -> dict:
                     "overlap_mm3": round(vol, 4),
                 }
                 try:
-                    obb = overlap.bounding_box()
+                    items = overlap if isinstance(overlap, list) else [overlap]
+                    from build123d import Compound
+                    obb = Compound(children=[x for x in items]).bounding_box()
                     entry["overlap_bbox_min"] = [
                         round(v, 3) for v in (obb.min.X, obb.min.Y, obb.min.Z)
                     ]
@@ -500,14 +611,165 @@ def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001) -> dict:
                     ]
                 except Exception:
                     pass  # location is best-effort; the clash itself stands
-                clashes.append(entry)
-    return {
+                if any(kernel.pair_matches(pt, a["ref"], b["ref"]) for pt in expected):
+                    intended.append(entry)
+                else:
+                    clashes.append(entry)
+            elif near_miss_mm:
+                # boxes overlap but the solids may still be apart
+                gap = a["solid"].distance_to(b["solid"])
+                if gap < near_miss_mm:
+                    near.append({"a": a["ref"], "b": b["ref"], "gap_mm": round(gap, 3)})
+    out = {
         "clear": not clashes and not check_errors,
         "solids": len(entries),
         "pairs_checked": pairs,
         "clashes": clashes,
         "check_errors": check_errors,
     }
+    if expected:
+        out["expected_overlaps"] = intended
+    if near_miss_mm:
+        out["near_misses"] = sorted(near, key=lambda n: n["gap_mm"])
+    return out
+
+
+@mcp.tool()
+def query_features(path: str, part: str | None = None,
+                   kinds: list[str] | None = None,
+                   region_min: list[float] | None = None,
+                   region_max: list[float] | None = None,
+                   min_area_mm2: float = 1.0, max_results: int = 80) -> dict:
+    """List geometric features of a model: cylinders (radius, axis, length,
+    hole vs boss) and planes (normal, centre, area). Use it to read real
+    dimensions off vendor CAD or a Shapr3D export - thread shoulders, hole
+    sizes, pocket floors - before designing against them.
+
+    Args:
+        part: Only solids whose ref contains this (assembly child label,
+            e.g. "VGC10" or "VGC10#3").
+        kinds: Subset of ["cylinder", "plane"]; default both.
+        region_min / region_max: [x, y, z] box; only faces touching it.
+        min_area_mm2: Skip planes smaller than this (fillet slivers).
+    """
+    src = _resolve(path)
+    if not src.exists():
+        raise FileNotFoundError(f"No such file: {src}")
+    kinds_set = set(kinds or ["cylinder", "plane"])
+    bad = kinds_set - {"cylinder", "plane"}
+    if bad:
+        raise ValueError(f"Unknown kinds {sorted(bad)}; use cylinder / plane")
+    entries = kernel.labelled_solids(_import_any(src), src.name)
+    if part:
+        entries = [e for e in entries if kernel.norm(part) in kernel.norm(e["ref"])]
+        if not entries:
+            raise ValueError(f"No solids match part '{part}'")
+    region = None
+    if region_min or region_max:
+        if not (region_min and region_max):
+            raise ValueError("Give both region_min and region_max")
+        region = (region_min, region_max)
+    feats = kernel.query_features(entries, kinds_set, region, min_area_mm2, max_results)
+    return {"solids_searched": len(entries), "features": feats,
+            "truncated": len(feats) >= max_results}
+
+
+@mcp.tool()
+def section_view(path: str, plane: str = "XZ", offset: float = 0.0,
+                 width: int = 900, height: int = 900) -> Image:
+    """Cut the model with a plane and draw the cross-section in 2-D (parts
+    coloured separately, mm grid). Shows wall thickness, internal channels
+    and whether cuts really happened - things a shaded render hides.
+
+    Args:
+        plane: "XY", "XZ" or "YZ".
+        offset: Plane position along its normal (mm), e.g. y=0 for XZ.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import PathPatch
+    from matplotlib.path import Path as MPath
+
+    src = _resolve(path)
+    if not src.exists():
+        raise FileNotFoundError(f"No such file: {src}")
+    shape = _import_any(src)
+    entries = kernel.labelled_solids(shape, src.name)
+    pl = kernel.section_plane(plane, offset)
+    bb = shape.bounding_box()
+    size = 4 * max(bb.size.X, bb.size.Y, bb.size.Z, 1.0)
+
+    fig, ax = plt.subplots(figsize=(width / 100, height / 100), dpi=100)
+    palette = plt.get_cmap("tab10")
+    parts, colours, areas = [], {}, {}
+    for e in entries:
+        faces = kernel.section_faces(e["solid"], pl, size)
+        if not faces:
+            continue
+        if e["part"] not in colours:
+            colours[e["part"]] = palette(len(colours) % 10)
+            parts.append(e["part"])
+        for f in faces:
+            areas[e["part"]] = areas.get(e["part"], 0.0) + f.area
+            verts, codes = [], []
+            for ring in kernel.face_rings(f, pl):
+                verts += ring + [ring[0]]
+                codes += [MPath.MOVETO] + [MPath.LINETO] * (len(ring) - 1) + [MPath.CLOSEPOLY]
+            ax.add_patch(PathPatch(MPath(verts, codes), facecolor=colours[e["part"]],
+                                   edgecolor="black", linewidth=0.4, alpha=0.85))
+    if not parts:
+        plt.close(fig)
+        raise ValueError(f"Plane {plane} at {offset} mm does not cut the model")
+    ax.autoscale_view()
+    ax.set_aspect("equal")
+    ax.grid(True, linewidth=0.3)
+    axes = {"XY": ("X", "Y"), "XZ": ("X", "Z"), "YZ": ("Y", "Z")}[plane.upper()]
+    ax.set_xlabel(f"{axes[0]} (mm)")
+    ax.set_ylabel(f"{axes[1]} (mm)")
+    normal = {"XY": "Z", "XZ": "Y", "YZ": "X"}[plane.upper()]
+    ax.set_title(f"Section {plane.upper()} at {normal} = {offset:g} mm", fontsize=10)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=colours[p]) for p in parts]
+    ax.legend(handles, [f"{p} ({areas[p]:.0f} mm²)" for p in parts], fontsize=7,
+              loc="upper left", bbox_to_anchor=(1.01, 1))
+    out = WORKDIR / f"{_safe_name(src.stem)}_section_{plane.upper()}_{offset:g}.png"
+    fig.savefig(out, bbox_inches="tight", pad_inches=0.1)
+    plt.close(fig)
+    return Image(path=str(out))
+
+
+@mcp.tool()
+def diff_models(before: str, after: str, part: str | None = None,
+                min_volume_mm3: float = 0.01) -> dict:
+    """Compare two versions of a model - e.g. the STEP you sent to Shapr3D
+    and the STEP the user exported after editing it there - to see what
+    changed: material added/removed (regions with bounding boxes), volume
+    change, and faces present in only one version (a chamfer shows up as
+    new angled planes, a fillet as new cylinders/tori).
+
+    Args:
+        part: Restrict to solids whose ref contains this (assembly label).
+            Both files must contain a match.
+    """
+    srcs = []
+    for p in (before, after):
+        src = _resolve(p)
+        if not src.exists():
+            raise FileNotFoundError(f"No such file: {src}")
+        srcs.append(src)
+    shapes = []
+    for src in srcs:
+        entries = kernel.labelled_solids(_import_any(src), src.name)
+        if part:
+            entries = [e for e in entries if kernel.norm(part) in kernel.norm(e["ref"])]
+            if not entries:
+                raise ValueError(f"No solids match part '{part}' in {src.name}")
+        from build123d import Compound
+        solids = [e["solid"] for e in entries]
+        shapes.append(solids[0] if len(solids) == 1 else Compound(children=solids))
+    report = kernel.diff_solids(shapes[0], shapes[1], min_volume_mm3)
+    report["before"], report["after"] = str(srcs[0]), str(srcs[1])
+    return report
 
 
 @mcp.tool()
@@ -948,6 +1210,33 @@ fillet(edges, radius=2), chamfer(edges, length=1)
 ## Threads/text/etc
 Threads: use build123d objects or import; for Shapr3D round-trip prefer
 plain geometry. Text on faces: BuildSketch on a face + Text + extrude.
+
+## Helpers available in every script (create_model / modify_model / run_model_file)
+cut(a, *tools), fuse(a, *tools)   booleans checked against the real overlap:
+                                  raise if OpenCascade silently did nothing,
+                                  warn (boolean_warnings) if a tool missed.
+load_cad("vendor/x.step")         import STEP/IGES/STL/BREP/3MF; STEP/IGES are
+                                  cached as BREP, so re-runs are fast.
+include("part.py")                run another script in the same namespace.
+export_part(shape, "name", ["step", "stl"])   extra output files.
+Label assembly children (shape.label = "Bracket", shape.color = Color(...)):
+reports list them as parts and detect_clash names clashes after them.
+
+## Pitfalls (each cost real debugging time)
+- loft()/extrude() in algebra mode return a Part wrapping a Compound;
+  `part - that` can silently do nothing. Use cut()/fuse() or .solids()[0].
+- Tool pieces offset by ~0.01 mm (z_top + 0.01 on one, z_top on the next)
+  make booleans fail silently. Fuse pieces on an exact shared face first.
+- `Box(...).fillet(...)` / `.chamfer(...)` on a primitive raises a
+  TypeError; use Solid(box.wrapped).fillet(...) or the BuildPart fillet().
+- Filters by position need a size/depth condition too: a part centred on
+  the axis "matches" every port at (0, 0).
+
+## Checking work without Shapr3D
+query_features (holes, bosses, planes - real dimensions of vendor CAD),
+section_view (2-D cut: walls, channels, whether cuts happened),
+detect_clash(expected=[...threads, hoses], near_miss_mm=...),
+diff_models (what the user changed after editing in Shapr3D).
 
 ## Tips for Shapr3D round-trips
 - Always export STEP for editability in Shapr3D (STL is a dumb mesh).
