@@ -591,6 +591,87 @@ def _activate_app() -> None:
         )
 
 
+IMPORTS_MANIFEST = WORKDIR / ".shapr3d_imports.json"
+
+
+def _body_count(src: Path) -> int:
+    return len(kernel.load_cad(src, _import_any, CACHE_DIR).solids())
+
+
+def _remember_import(src: Path) -> None:
+    """Record how many bodies this model had when imported, so a later
+    re-import can recognise its previous version in the Items sidebar."""
+    import json
+
+    try:
+        data = json.loads(IMPORTS_MANIFEST.read_text()) if IMPORTS_MANIFEST.exists() else {}
+        data[src.stem] = _body_count(src)
+        IMPORTS_MANIFEST.write_text(json.dumps(data, indent=1))
+    except Exception:
+        pass  # bookkeeping only
+
+
+def _replace_previous(src: Path) -> dict:
+    """Delete the previous import of this model from the open project if it
+    can be identified unambiguously (see open_in_shapr3d's `replace`)."""
+    import json
+
+    shot = WORKDIR / "_shapr3d_ui.png"
+    _, items = macos.read_ui(shot)
+    rows = macos.item_rows(items)
+    if not rows:
+        return {"deleted": [], "note": "Items sidebar not visible; previous version (if any) left in place."}
+    matches = [r for r in rows if macos.name_matches(r, src.stem)]
+    if not matches:
+        return {"deleted": [], "note": ""}  # new model: just add it
+    if len(matches) > 1:
+        return {"deleted": [], "note": (
+            f"{len(matches)} items look like '{src.stem}' "
+            f"({', '.join(m['text'] for m in matches)}); left them all in place.")}
+    row = matches[0]
+    try:
+        known = json.loads(IMPORTS_MANIFEST.read_text()).get(src.stem) if IMPORTS_MANIFEST.exists() else None
+    except Exception:
+        known = None
+    expected = {known, _body_count(src)} - {None}
+    macos.activate()
+    macos.click_screen(row["screen_x"], row["screen_y"])
+    count = None
+    for _ in range(8):  # the "N bodies" label takes a moment on big models
+        time.sleep(0.5)
+        _, items = macos.read_ui(shot)
+        count = macos.selected_body_count(items)
+        if count is not None:
+            break
+    if not macos.body_count_close(count, expected):
+        macos.keys("escape")
+        return {"deleted": [], "note": (
+            f"'{row['name']}' has {count} bodies, expected {sorted(expected)}; "
+            "not sure it's the previous version, so it was left in place.")}
+    delete = macos.match_text("Delete", items)
+    if not delete:
+        macos.keys("escape")
+        return {"deleted": [], "note": "Delete button not found; previous version left in place."}
+    macos.click_screen(delete["screen_x"], delete["screen_y"])
+    time.sleep(0.6)
+    _, items = macos.read_ui(shot)
+    if len(macos.item_rows(items)) != len(rows) - 1:
+        return {"deleted": [], "note": "Deleting the previous version could not be confirmed; check the Items list."}
+    return {"deleted": [row["name"] + ("…" if row["truncated"] else "")], "note": ""}
+
+
+def _sidebar_rows() -> list[dict] | None:
+    """Top-level Items sidebar rows, or None if the sidebar isn't visible."""
+    try:
+        _, items = macos.read_ui(WORKDIR / "_shapr3d_ui.png")
+    except Exception:
+        return None
+    rows = macos.item_rows(items)
+    edge = macos.sidebar_max_x(items)
+    has_sidebar = any(i["text"].strip() == "Items" and i["x"] < edge for i in items)
+    return rows if has_sidebar else None
+
+
 def _project_is_open() -> bool:
     """A project is open when the File menu offers "Import File…"; on the
     home screen it only has "Import as new project…". If the menu can't be
@@ -1318,7 +1399,8 @@ IMPORT_DIALOG_NOTE = (
 
 
 @mcp.tool()
-def open_in_shapr3d(path: str, new_project: bool | None = None) -> str:
+def open_in_shapr3d(path: str, new_project: bool | None = None,
+                    replace: bool = True) -> str:
     """Open a CAD file in Shapr3D as a real editable body.
 
     Verified against Shapr3D 26.143.0 - two things the original approach got
@@ -1349,6 +1431,14 @@ def open_in_shapr3d(path: str, new_project: bool | None = None) -> str:
             screen (no project open) a new project is created. Pass True
             ONLY when the user asks to start a new model/project; False
             forces the current project.
+        replace: When importing into an open project (macOS), first delete
+            the previous version of this model - the top-level item named
+            after the file - so iterating doesn't pile up copies. It is
+            only deleted when exactly one item matches the name AND its body
+            count equals what was imported last time (or this file's); else
+            it is left alone and reported. If the new import can't be
+            confirmed, the deletion is undone. A file with a new name is
+            simply added. Pass False to keep the old version.
 
     Raises:
         RuntimeError: if the History panel doesn't show this file as imported
@@ -1413,36 +1503,70 @@ def open_in_shapr3d(path: str, new_project: bool | None = None) -> str:
         '''
         _osascript(script)
 
+    replaced: dict = {"deleted": [], "note": ""}
+    if replace and not new_project and sys.platform == "darwin":
+        replaced = _replace_previous(src)
+
     needle = f'Import "{src.name}"'
+    # Confirm via the Items sidebar (one more top-level item with this
+    # model's name): fast at any project size. The History-panel search
+    # walks the whole accessibility tree and takes >15 s on large projects.
+    before = None
+    if not new_project:
+        rows = _sidebar_rows()
+        if rows is not None:
+            before = sum(macos.name_matches(r, src.stem) for r in rows)
+
+    def _arrived() -> bool:
+        if before is not None:
+            rows = _sidebar_rows()
+            return rows is not None and sum(
+                macos.name_matches(r, src.stem) for r in rows) > before
+        try:
+            return _shapr3d_history_mentions(needle)
+        except subprocess.TimeoutExpired:
+            return False
+
     attempts = 0
-    for attempts in (1, 2):
+    for attempts in (1,):  # no automatic retry: a slow import + retry = duplicate
         _attempt()
-        # The import (or the failure mode this replaced - a silent empty
-        # project) both finish well under a second once triggered; poll
-        # briefly rather than guessing a single fixed delay.
+        # big STEP files (vendor CAD, 100+ bodies) take a minute to appear
         confirmed = False
-        for _ in range(10):
-            if _shapr3d_history_mentions(needle):
+        for _ in range(130):
+            if _arrived():
                 confirmed = True
                 break
-            time.sleep(0.5)
+            time.sleep(0.7)
         if confirmed:
+            _remember_import(src)
+            note = ""
+            if replaced["deleted"]:
+                note = f" Replaced the previous version ({', '.join(replaced['deleted'])})."
+            elif replaced["note"]:
+                note = f" {replaced['note']}"
             return (
-                f"Imported {src.name} into a "
-                f"{'new' if new_project else 'the current'} Shapr3D project "
+                f"Imported {src.name} into "
+                f"{'a new' if new_project else 'the current'} Shapr3D project "
                 f"via File > Import File... (UI-automated - Shapr3D has no "
-                f"API for this). Confirmed via the History panel"
-                f"{' after a retry' if attempts == 2 else ''} - not just "
-                "assumed from timing."
+                f"API for this). Confirmed in Shapr3D"
+                " - not just assumed from timing." + note
             )
 
+    if replaced["deleted"]:
+        # nothing new arrived: bring the deleted previous version back
+        macos.activate()
+        for _ in replaced["deleted"]:
+            macos.keys("cmd+z")
+            time.sleep(0.4)
     raise RuntimeError(
-        f"Could not confirm {src.name} was imported into Shapr3D after "
-        f"{attempts} attempts (checked the History panel for "
-        f"'{needle}' and didn't find it). Call screenshot_shapr3d to see "
+        f"Could not confirm {src.name} was imported into Shapr3D within "
+        "90 s (no new item in the Items sidebar / History panel). It was not "
+        "retried, to avoid a duplicate. Call screenshot_shapr3d to see "
         "what actually happened - a dialog may be blocking input, or "
         "Accessibility/Automation permission may need re-granting in "
         "System Settings > Privacy & Security."
+        + (" The previous version that was deleted first has been restored "
+           "(Cmd+Z)." if replaced["deleted"] else "")
     )
 
 

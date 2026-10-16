@@ -154,6 +154,7 @@ def fake_import(monkeypatch):
     monkeypatch.setattr(server.time, "sleep", lambda s: None)
     monkeypatch.setattr(server, "_osascript", lambda sc: scripts.append(sc) or "")
     monkeypatch.setattr(server, "_shapr3d_history_mentions", lambda needle: True)
+    monkeypatch.setattr(macos, "read_ui", lambda out: (WIN, []))  # no sidebar
     server.create_model("iterate_me", "result = Box(5, 5, 5)")
     return scripts
 
@@ -186,3 +187,148 @@ def test_unreadable_menu_never_starts_new_project(fake_import, monkeypatch):
     monkeypatch.setattr(macos, "menu_items", boom)
     server.open_in_shapr3d("iterate_me.step")
     assert 'keystroke "n"' not in fake_import[0]
+
+
+
+# ---------------------------------------------------------------------------
+# replace the previous version on re-import
+# ---------------------------------------------------------------------------
+
+def row(text, y, left=60):
+    return {"text": text, "x": left + 50, "y": y, "left": left,
+            "screen_x": left + 50, "screen_y": y + 34}
+
+
+SIDEBAR = [row("Items", 82, 24), row("9 All Items", 118, 30)]
+
+
+@pytest.mark.parametrize("text,stem,hit", [
+    ("› O vgc10_assembl...", "vgc10_assembly", True),        # truncated prefix
+    (") vgc10_assembly", "vgc10_assembly", True),            # OCR glyph noise
+    ("vgc10_assembly_step", "vgc10_assembly", True),
+    ("› O vgc10_assembl...", "bracket", False),
+    ("› O vgc...", "vgc10_assembly", False),                 # prefix too short
+    ("vgc10_assembly_edited", "vgc10_assembly", False),      # full other name
+])
+def test_name_matches(text, stem, hit):
+    r = dict(row(text, 150))
+    r["name"], r["truncated"] = macos.clean_item_name(text)
+    assert macos.name_matches(r, stem) is hit
+
+
+def test_item_rows_names_and_glyph_fragments():
+    items = SIDEBAR + [row("› O vgc10_assembl...", 147), row("› 0", 171, left=27),
+                       row("vgc10_assembl...", 172, left=70), row("Modeling", 82, 270)]
+    rows = macos.item_rows(items)
+    assert [(r["name"], r["y"]) for r in rows] == [("vgc10_assembl", 147), ("vgc10_assembl", 172)]
+
+
+def test_all_items_anchor_without_space():
+    items = [row("Items", 82, 24), row("AllItems", 119, 30), row("› O part", 147)]
+    assert [r["name"] for r in macos.item_rows(items)] == ["part"]
+
+
+def test_activate_waits_for_front(monkeypatch):
+    fronts = iter(["firefox", "firefox", "Shapr3D"])
+    monkeypatch.setattr(macos.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(macos.time, "sleep", lambda s: None)
+    monkeypatch.setattr(macos, "_jxa", lambda script, *a, **k: next(fronts))
+    macos.activate()  # returns only once Shapr3D is in front
+
+
+def test_activate_refuses_when_never_front(monkeypatch):
+    monkeypatch.setattr(macos.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(macos.time, "sleep", lambda s: None)
+    monkeypatch.setattr(macos, "_jxa", lambda script, *a, **k: "firefox")
+    with pytest.raises(RuntimeError, match="not clicking"):
+        macos.activate(timeout_s=0)
+
+
+def test_sidebar_edge_follows_resized_sidebar():
+    narrow = [row("Modeling", 82, 270)]
+    wide = [row("Modeling", 82, 385)]
+    assert macos.sidebar_max_x(narrow) == 230 and macos.sidebar_max_x(wide) == 345
+    assert macos.sidebar_max_x([]) == macos.SIDEBAR_MAX_X
+
+
+def test_selected_body_count():
+    assert macos.selected_body_count([row("Deselect All", 312), row("113 bodies", 328)]) == 113
+    assert macos.selected_body_count([row("1 body", 328)]) == 1
+    assert macos.selected_body_count([row("Modeling", 82)]) is None
+
+
+@pytest.fixture
+def screens(fake_import, monkeypatch):
+    """Feed read_ui a scripted sequence of screens; record clicks/keys."""
+    state = {"screens": [], "clicks": [], "keys": []}
+    def read_ui(out):
+        # scripted screens; the last one stays on screen
+        scr = state["screens"]
+        return WIN, (scr.pop(0) if len(scr) > 1 else scr[0])
+    monkeypatch.setattr(macos, "read_ui", read_ui)
+    monkeypatch.setattr(server, "_shapr3d_history_mentions",
+                        lambda needle: pytest.fail("sidebar should confirm, not History"))
+    monkeypatch.setattr(macos, "activate", lambda: None)
+    monkeypatch.setattr(macos, "click_screen", lambda x, y: state["clicks"].append((x, y)))
+    monkeypatch.setattr(macos, "keys", lambda c: state["keys"].append(c))
+    monkeypatch.setattr(macos, "menu_items", lambda p: ["Import File…"])
+    return state
+
+
+OLD = row("› O iterate_me", 147)
+SELECTED = SIDEBAR + [OLD, row("Deselect All", 312, 270), row("1 body", 328, 270),
+                      row("Delete", 779, 270)]
+
+
+NEW = row("› O iterate_me", 147)
+
+
+def test_reimport_deletes_previous_version(screens, fake_import):
+    # replace: list -> selected -> deleted; confirm: before (0) -> arrived (1)
+    screens["screens"] = [SIDEBAR + [OLD], SELECTED, SIDEBAR, SIDEBAR, SIDEBAR + [NEW]]
+    msg = server.open_in_shapr3d("iterate_me.step")
+    assert len(fake_import) == 1  # imported once
+    assert screens["clicks"] == [(OLD["screen_x"], OLD["screen_y"]), (320, 779 + 34)]
+    assert "Replaced the previous version (iterate_me)" in msg
+
+
+def test_reimport_keeps_item_with_other_body_count(screens):
+    other = SELECTED[:-2] + [row("7 bodies", 328, 270), row("Delete", 779, 270)]
+    screens["screens"] = [SIDEBAR + [OLD], other, SIDEBAR + [OLD], SIDEBAR + [OLD, NEW]]
+    msg = server.open_in_shapr3d("iterate_me.step")
+    assert len(screens["clicks"]) == 1 and screens["keys"] == ["escape"]
+    assert "7 bodies" in msg and "left in place" in msg
+
+
+def test_reimport_ambiguous_names_left_alone(screens):
+    two = SIDEBAR + [row("› O iterate_m...", 147), row("› O iterate_me", 171)]
+    screens["screens"] = [two, two, two + [row("› O iterate_me", 195)]]
+    msg = server.open_in_shapr3d("iterate_me.step")
+    assert screens["clicks"] == [] and "left them all in place" in msg
+
+
+def test_new_model_is_added_not_replacing(screens):
+    screens["screens"] = [SIDEBAR + [row("› O bracket", 147)]] * 2 + [
+        SIDEBAR + [row("› O bracket", 147), row("› O iterate_me", 171)]]
+    msg = server.open_in_shapr3d("iterate_me.step")
+    assert screens["clicks"] == [] and "Replaced" not in msg
+
+
+def test_failed_import_restores_deleted_version(screens, fake_import):
+    screens["screens"] = [SIDEBAR + [OLD], SELECTED, SIDEBAR]  # nothing arrives
+    with pytest.raises(RuntimeError, match="restored"):
+        server.open_in_shapr3d("iterate_me.step")
+    assert screens["keys"] == ["cmd+z"]
+    assert len(fake_import) == 1  # never re-imported: a slow import would duplicate
+
+
+def test_replace_false_never_touches_items(screens):
+    screens["screens"] = [SIDEBAR + [OLD], SIDEBAR + [OLD, NEW]]
+    server.open_in_shapr3d("iterate_me.step", replace=False)
+    assert screens["clicks"] == []
+
+
+def test_body_count_tolerance():
+    assert macos.body_count_close(112, {113})      # Shapr3D merged a vendor sliver
+    assert not macos.body_count_close(120, {113})  # user added parts
+    assert not macos.body_count_close(None, {113})

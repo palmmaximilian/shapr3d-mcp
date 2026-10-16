@@ -138,9 +138,22 @@ def is_running() -> bool:
     return subprocess.run(["pgrep", "-x", APP_NAME], capture_output=True).returncode == 0
 
 
-def activate() -> None:
+def activate(timeout_s: float = 3.0) -> None:
+    """Bring Shapr3D to the front and WAIT until it really is frontmost:
+    clicks and keystrokes go to whatever app is in front, so acting early
+    would land them in the user's other app."""
     subprocess.run(["open", "-a", APP_NAME], check=True, timeout=15)
-    time.sleep(0.4)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        time.sleep(0.25)
+        try:
+            if _jxa(_FRONT_JS) == APP_NAME:
+                time.sleep(0.2)  # let the window take key focus
+                return
+        except RuntimeError:
+            pass
+        if time.monotonic() > deadline:
+            raise RuntimeError("Shapr3D did not come to the front; not clicking/typing.")
 
 
 def window() -> dict:
@@ -184,6 +197,8 @@ def to_points(item: dict, win: dict) -> dict:
     return {
         "text": item["text"],
         "x": wx, "y": wy,                       # window points
+        "left": round(item["x"] * win["w"]),    # label's left edge
+        "width": round(item["w"] * win["w"]),
         "screen_x": round(win["x"] + wx), "screen_y": round(win["y"] + wy),
     }
 
@@ -339,3 +354,93 @@ def fill_save_dialog(name: str, folder: str) -> None:
 
 def permissions(prompt: bool) -> dict:
     return json.loads(_jxa(_PERMS_JS, "1" if prompt else "0", timeout=60))
+
+
+# ---------------------------------------------------------------------------
+# Items sidebar (top-level objects in the open project)
+# ---------------------------------------------------------------------------
+
+SIDEBAR_MAX_X = 210          # Items sidebar width in window points
+_ROW_NOISE = {"›", ">", "v", "o", "0", "•", ")", "(", "»", "9", "|"}
+
+
+def clean_item_name(text: str) -> tuple[str, bool]:
+    """OCR'd sidebar row -> (name, truncated). Drops the chevron / folder
+    glyphs OCR reads as stray characters and the trailing ellipsis Shapr3D
+    adds to long names."""
+    words = text.strip().split()
+    while words and (words[0].lower() in _ROW_NOISE or len(words[0]) == 1):
+        words.pop(0)
+    name = " ".join(words)
+    truncated = name.endswith(("...", "…", ".."))
+    return name.rstrip(".…").strip(), truncated
+
+
+TOOLBAR_LABELS = ("Modeling", "Visualization", "Search", "Sketch", "Items")
+
+
+def sidebar_max_x(items: list[dict]) -> float:
+    """Right edge of the (resizable) Items sidebar: just left of the tool
+    column, whose labels sit right of it. Falls back to the default width."""
+    tool_lefts = [i["left"] for i in items
+                  if i["text"].strip().split(" ")[0] in TOOLBAR_LABELS and i["left"] > 150]
+    return min(tool_lefts) - 40 if tool_lefts else SIDEBAR_MAX_X
+
+
+def item_rows(items: list[dict]) -> list[dict]:
+    """Named rows of the Items sidebar: [{name, truncated, x, y, ...}].
+
+    No indent filtering: OCR measures the chevron/folder glyphs differently
+    from letters, so levels can't be told apart reliably. Rows are matched
+    by model name, and parts inside an (expanded) group don't carry the
+    model's file name, so they never match.
+    """
+    edge = sidebar_max_x(items)
+    header = [i for i in items if i["text"].strip() == "Items" and i["x"] < edge]
+    if not header:
+        return []  # sidebar hidden
+    anchors = [i["y"] for i in items
+               if "allitems" in i["text"].lower().replace(" ", "") and i["x"] < edge]
+    top = max(anchors) if anchors else header[0]["y"]
+    rows = []
+    for i in items:
+        if i["x"] < edge and i["y"] > top + 8:
+            r = dict(i)
+            r["name"], r["truncated"] = clean_item_name(r["text"])
+            if r["name"]:  # glyph-only fragments ("› 0") have no name
+                rows.append(r)
+    return rows
+
+
+def name_matches(row: dict, stem: str) -> bool:
+    """Exact name (as Shapr3D names imports: the file stem), or a truncated
+    prefix long enough to mean something. Compared punctuation-insensitive
+    because OCR blurs '_' and '.'."""
+    import re
+
+    norm = lambda t: " ".join(re.sub(r"[^0-9a-z]+", " ", t.lower()).split())
+    name, want = norm(row["name"]), norm(stem)
+    if not row["truncated"]:
+        return name in {want, f"{want} step", f"{want} stp"}
+    return len(name) >= 6 and want.startswith(name)
+
+
+def selected_body_count(items: list[dict]) -> int | None:
+    """'113 bodies' / '1 body' label Shapr3D shows while something is selected."""
+    import re
+
+    for i in items:
+        m = re.search(r"(\d+)\s*bod(y|ies)", i["text"].lower())
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def body_count_close(seen: int | None, expected: set[int]) -> bool:
+    """Shapr3D's body count can differ slightly from the file's solid count
+    (it merges/drops degenerate vendor sub-solids: 113 solids -> 112 bodies),
+    so allow +-2 bodies or 2%. A larger difference (user added parts) is
+    treated as a different model."""
+    if seen is None:
+        return False
+    return any(abs(seen - e) <= max(2, 0.02 * e) for e in expected)
