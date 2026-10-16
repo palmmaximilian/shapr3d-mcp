@@ -124,6 +124,17 @@ def _bbox(shape) -> dict:
 GENERIC_LABELS = {"", "assembly"}  # what STEP import gives unnamed children
 
 
+def unwrap_groups(shape):
+    """Descend through single-child wrapper groups (Shapr3D exports put the
+    whole assembly under one top-level group named after the file)."""
+    while True:
+        children = list(getattr(shape, "children", []) or [])
+        if len(children) == 1 and list(getattr(children[0], "children", []) or []):
+            shape = children[0]
+        else:
+            return shape
+
+
 def child_names(shape, file_tag: str) -> list[str] | None:
     """Names for an assembly's top-level children, or None if it has no
     real labels. Generic / repeated labels get a positional suffix."""
@@ -145,6 +156,7 @@ def child_names(shape, file_tag: str) -> list[str] | None:
 def part_inventory(shape) -> list[dict]:
     """Top-level assembly children with solid counts, volume and bbox.
     Empty when the shape is not an assembly with labelled children."""
+    shape = unwrap_groups(shape)
     names = child_names(shape, "part")
     if not names:
         return []
@@ -162,6 +174,7 @@ def part_inventory(shape) -> list[dict]:
 
 def labelled_solids(shape, file_tag: str) -> list[dict]:
     """[{ref, part, solid}] - refs use assembly child labels when present."""
+    shape = unwrap_groups(shape)
     names = child_names(shape, file_tag)
     out = []
     if names:
@@ -315,10 +328,22 @@ def section_faces(solid, plane, size: float):
 def face_rings(face, plane, samples: int = 160) -> list[list[tuple[float, float]]]:
     """Outer + inner wires of a planar face as 2-D rings in plane coords;
     outer counter-clockwise, holes clockwise (for non-zero fill)."""
+    from build123d import Edge, GeomType
+    from OCP.BRepTools import BRepTools_WireExplorer
+
     rings = []
     wires = [face.outer_wire()] + list(face.inner_wires())
     for k, w in enumerate(wires):
-        pts = [plane.to_local_coords(w.position_at(i / samples)) for i in range(samples)]
+        # walk edges in wire order (through every vertex, so sharp corners
+        # stay sharp); lines need only their start point
+        pts = []
+        explorer = BRepTools_WireExplorer(w.wrapped, face.wrapped)
+        while explorer.More():
+            e = Edge(explorer.Current())
+            n = 1 if e.geom_type == GeomType.LINE else max(8, samples // 8)
+            # position_at already follows the edge's orientation in the wire
+            pts += [plane.to_local_coords(e.position_at(i / n)) for i in range(n)]
+            explorer.Next()
         ring = [(p.X, p.Y) for p in pts]
         area = 0.5 * sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(ring, ring[1:] + ring[:1]))
         if (k == 0 and area < 0) or (k > 0 and area > 0):
@@ -335,6 +360,102 @@ def _face_sig(face) -> tuple:
     c = face.center()
     return (face.geom_type.name, round(c.X, 1), round(c.Y, 1), round(c.Z, 1),
             round(face.area, 1))
+
+
+def mass_props(solid) -> dict:
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+
+    g = GProp_GProps()
+    BRepGProp.VolumeProperties_s(solid.wrapped, g)
+    c, m = g.CentreOfMass(), g.MatrixOfInertia()
+    return {"volume": g.Mass(), "centroid": (c.X(), c.Y(), c.Z()),
+            "inertia": (m.Value(1, 1), m.Value(2, 2), m.Value(3, 3))}
+
+
+def same_shape(a, b, rel: float = 1e-4) -> bool:
+    """Equal volume, centroid and inertia: the same solid even if another
+    CAD kernel re-split or re-typed its faces (Shapr3D/Parasolid exports)."""
+    pa, pb = mass_props(a), mass_props(b)
+    v = max(pa["volume"], 1e-9)
+    if abs(pa["volume"] - pb["volume"]) > max(rel * v, 0.5):
+        return False
+    size = max(a.bounding_box().diagonal, 1e-9)
+    if math.dist(pa["centroid"], pb["centroid"]) > 1e-4 * size + 1e-3:
+        return False
+    return all(abs(x - y) <= 1e-3 * max(abs(x), 1e-9) for x, y in zip(pa["inertia"], pb["inertia"]))
+
+
+def cancel_artifact_pairs(removed: list[dict], added: list[dict]) -> tuple[list, list, int]:
+    """Drop removed/added region pairs with the same volume and bbox - the
+    signature of a boolean that failed on near-coincident faces (it 'removes'
+    the whole solid and 'adds' it back)."""
+    removed, added, dropped = list(removed), list(added), 0
+    for r in list(removed):
+        for q in added:
+            if (abs(r["volume_mm3"] - q["volume_mm3"]) <= 1e-3 * max(r["volume_mm3"], 1)
+                    and all(abs(x - y) < 0.05 for x, y in zip(r["min"] + r["max"], q["min"] + q["max"]))):
+                removed.remove(r)
+                added.remove(q)
+                dropped += 1
+                break
+    return removed, added, dropped
+
+
+def sampled_regions(a, b, step: float | None = None) -> tuple[list, list, float]:
+    """Point-sample both solids on a grid; cells inside only one of them
+    form removed / added regions (approximate, kernel-independent)."""
+    import numpy as np
+    from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+    from OCP.gp import gp_Pnt
+    from OCP.TopAbs import TopAbs_IN
+
+    bb_a, bb_b = a.bounding_box(), b.bounding_box()
+    lo = [min(getattr(bb_a.min, k), getattr(bb_b.min, k)) for k in "XYZ"]
+    hi = [max(getattr(bb_a.max, k), getattr(bb_b.max, k)) for k in "XYZ"]
+    if step is None:
+        # ~30k cells keeps this to seconds (each cell is one classifier call)
+        box_vol = math.prod(max(h - l, 1e-3) for l, h in zip(lo, hi))
+        step = max((box_vol / 30000) ** (1 / 3), 0.25)
+    axes = [np.arange(l + step / 2, h, step) for l, h in zip(lo, hi)]
+    shape = tuple(len(x) for x in axes)
+
+    def inside(solid):
+        cls = BRepClass3d_SolidClassifier(solid.wrapped)
+        grid = np.zeros(shape, dtype=bool)
+        for i, x in enumerate(axes[0]):
+            for j, y in enumerate(axes[1]):
+                for k, z in enumerate(axes[2]):
+                    cls.Perform(gp_Pnt(x, y, z), 1e-6)
+                    grid[i, j, k] = cls.State() == TopAbs_IN
+        return grid
+
+    ia, ib = inside(a), inside(b)
+
+    def regions(mask):
+        seen = np.zeros_like(mask)
+        out = []
+        for start in zip(*np.nonzero(mask)):
+            if seen[start]:
+                continue
+            stack, cells = [start], []
+            seen[start] = True
+            while stack:
+                c = stack.pop()
+                cells.append(c)
+                for d in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+                    n = (c[0] + d[0], c[1] + d[1], c[2] + d[2])
+                    if all(0 <= n[t] < shape[t] for t in range(3)) and mask[n] and not seen[n]:
+                        seen[n] = True
+                        stack.append(n)
+            idx = np.array(cells)
+            mn = [float(axes[t][idx[:, t].min()] - step / 2) for t in range(3)]
+            mx = [float(axes[t][idx[:, t].max()] + step / 2) for t in range(3)]
+            out.append({"volume_mm3": round(len(cells) * step ** 3, 1),
+                        "min": [round(v, 1) for v in mn], "max": [round(v, 1) for v in mx]})
+        return sorted(out, key=lambda r: -r["volume_mm3"])
+
+    return regions(ia & ~ib), regions(ib & ~ia), step
 
 
 def describe_face(face) -> dict:
@@ -358,35 +479,55 @@ def _regions(shape, min_volume: float) -> list[dict]:
     out = []
     for it in items:
         for s in it.solids():
-            if s.volume >= min_volume:
-                out.append({"volume_mm3": round(s.volume, 3), **_bbox(s)})
+            if s.volume < min_volume:
+                continue
+            bb = s.bounding_box()
+            if s.volume < 1e-5 * max(bb.size.X * bb.size.Y * bb.size.Z, 1e-9):
+                continue  # sliver from near-coincident faces, not a real change
+            out.append({"volume_mm3": round(s.volume, 3), **_bbox(s)})
     return sorted(out, key=lambda r: -r["volume_mm3"])
 
 
+def _touches(face, regions, pad: float = 1.0) -> bool:
+    bb = face.bounding_box()
+    for r in regions:
+        if not (bb.max.X < r["min"][0] - pad or bb.min.X > r["max"][0] + pad or
+                bb.max.Y < r["min"][1] - pad or bb.min.Y > r["max"][1] + pad or
+                bb.max.Z < r["min"][2] - pad or bb.min.Z > r["max"][2] + pad):
+            return True
+    return False
+
+
 def diff_solids(a, b, min_volume: float = 0.01, max_faces: int = 30) -> dict:
-    """What changed from a to b: material added/removed (as regions with
-    bounding boxes) and faces that exist only in one of them."""
+    """What changed from a to b: material added/removed (regions with
+    bounding boxes) and the new/removed faces inside those regions.
+
+    Robust to round-trips through another CAD kernel: equal mass properties
+    count as unchanged, failed-boolean artifacts are cancelled, and if the
+    boolean result still doesn't add up it falls back to point sampling."""
     A, B = solidify(a), solidify(b)
+    base = {"volume_before_mm3": round(A.volume, 3), "volume_after_mm3": round(B.volume, 3),
+            "volume_change_mm3": round(B.volume - A.volume, 3)}
+    if same_shape(A, B):
+        return {**base, "identical": True, "method": "mass properties",
+                "removed_regions": [], "added_regions": [], "new_faces": [], "removed_faces": []}
     removed = _regions(A - B, min_volume)
     added = _regions(B - A, min_volume)
+    removed, added, artifacts = cancel_artifact_pairs(removed, added)
+    method = "boolean"
+    net = sum(r["volume_mm3"] for r in added) - sum(r["volume_mm3"] for r in removed)
+    dv = B.volume - A.volume
+    if abs(net - dv) > 0.05 * max(abs(dv), 1.0) + 0.5:
+        removed, added, step = sampled_regions(A, B)
+        method = f"sampled ({step:.2f} mm grid, approximate)"
+    changed = removed + added
     sig_a = {_face_sig(f): f for f in A.faces()}
     sig_b = {_face_sig(f): f for f in B.faces()}
-    new_faces = [describe_face(f) for s, f in sig_b.items() if s not in sig_a]
-    gone_faces = [describe_face(f) for s, f in sig_a.items() if s not in sig_b]
-    types_a, types_b = {}, {}
-    for f in A.faces():
-        types_a[f.geom_type.name.lower()] = types_a.get(f.geom_type.name.lower(), 0) + 1
-    for f in B.faces():
-        types_b[f.geom_type.name.lower()] = types_b.get(f.geom_type.name.lower(), 0) + 1
-    return {
-        "volume_before_mm3": round(A.volume, 3),
-        "volume_after_mm3": round(B.volume, 3),
-        "volume_change_mm3": round(B.volume - A.volume, 3),
-        "removed_regions": removed,
-        "added_regions": added,
-        "face_types_before": types_a,
-        "face_types_after": types_b,
-        "new_faces": new_faces[:max_faces],
-        "removed_faces": gone_faces[:max_faces],
-        "identical": not removed and not added and not new_faces and not gone_faces,
-    }
+    new_faces = [describe_face(f) for sg, f in sig_b.items() if sg not in sig_a and _touches(f, changed)]
+    gone_faces = [describe_face(f) for sg, f in sig_a.items() if sg not in sig_b and _touches(f, changed)]
+    out = {**base, "identical": not changed, "method": method,
+           "removed_regions": removed, "added_regions": added,
+           "new_faces": new_faces[:max_faces], "removed_faces": gone_faces[:max_faces]}
+    if artifacts:
+        out["cancelled_artifacts"] = artifacts
+    return out

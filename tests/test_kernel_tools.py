@@ -305,6 +305,16 @@ def test_section_view_png_and_miss():
         server.section_view("sec_part.step", plane="XY", offset=500)
 
 
+def test_face_rings_keep_sharp_corners():
+    from build123d import Box
+
+    pl = kernel.section_plane("XZ", 0)
+    face = kernel.section_faces(Box(20, 20, 10), pl, 200)[0]
+    (ring,) = kernel.face_rings(face, pl)
+    assert sorted((round(x, 6), round(y, 6)) for x, y in ring) == [
+        (-10, -5), (-10, 5), (10, -5), (10, 5)]
+
+
 def test_face_rings_orientation():
     from build123d import Box, Cylinder
 
@@ -344,3 +354,75 @@ def test_diff_identical_and_part_filter():
     assert server.diff_models("diff_same_a.step", "diff_same_b.step", part="Lid")["identical"]
     with pytest.raises(ValueError, match="No solids match"):
         server.diff_models("diff_same_a.step", "diff_same_b.step", part="Gear")
+
+
+# ---------------------------------------------------------------------------
+# diff robustness (round-trips through Shapr3D's kernel)
+# ---------------------------------------------------------------------------
+
+def test_same_shape_ignores_kernel_noise():
+    from build123d import Box, Pos
+
+    a = Box(20, 20, 10)
+    assert kernel.same_shape(a, Pos(1e-7, 0, 0) * Box(20, 20, 10))
+    assert not kernel.same_shape(a, Pos(0.5, 0, 0) * Box(20, 20, 10))  # moved
+    assert not kernel.same_shape(a, Box(20, 20, 10.2))                 # resized
+    d = kernel.diff_solids(a, Pos(1e-7, 0, 0) * Box(20, 20, 10))
+    assert d["identical"] and d["method"] == "mass properties"
+
+
+def test_cancel_artifact_pairs():
+    whole = {"volume_mm3": 1000.0, "min": [0, 0, 0], "max": [10, 10, 10]}
+    real = {"volume_mm3": 5.0, "min": [8, 8, 8], "max": [10, 10, 10]}
+    removed, added, n = kernel.cancel_artifact_pairs([whole, real], [dict(whole, volume_mm3=1000.4)])
+    assert removed == [real] and added == [] and n == 1
+
+
+def test_sampled_regions_approximate_chamfer():
+    from build123d import Axis, Box, BuildPart, chamfer
+
+    with BuildPart() as p:
+        Box(20, 20, 10)
+        chamfer(p.edges().group_by(Axis.Z)[-1].sort_by(Axis.X)[-1:], 3)
+    removed, added, step = kernel.sampled_regions(Box(20, 20, 10), p.part)
+    assert added == [] and len(removed) == 1
+    assert removed[0]["volume_mm3"] == pytest.approx(0.5 * 9 * 20, rel=0.35)
+    assert removed[0]["min"][0] > 5  # at the +X top edge
+
+
+def test_diff_ignores_sliver_regions():
+    from build123d import Box, Pos
+
+    # 1 micron overlap difference -> a sliver, not a change worth reporting
+    d = kernel.diff_solids(Box(20, 20, 10), Pos(0, 0, 0.001) * Box(20, 20, 10))
+    assert all(r["volume_mm3"] > 0.01 for r in d["removed_regions"] + d["added_regions"])
+
+
+def test_inventory_descends_wrapper_group():
+    from build123d import Box, Compound, Pos
+
+    a, b = Box(5, 5, 5), Pos(10, 0, 0) * Box(5, 5, 5)
+    a.label, b.label = "Left", "Right"
+    wrapped = Compound(children=[Compound(children=[a, b], label="export.step")])
+    assert [p["part"] for p in kernel.part_inventory(wrapped)] == ["Left", "Right"]
+    assert [e["ref"] for e in kernel.labelled_solids(wrapped, "f")] == ["Left#0", "Right#0"]
+
+
+# ---------------------------------------------------------------------------
+# progress images
+# ---------------------------------------------------------------------------
+
+def test_quick_look_writes_sheet_and_filters():
+    server.create_model("ql_asm", ASM)
+    out = server.quick_look("ql_asm.step", exclude=["Bracket"])
+    assert Path(out["image"]).stat().st_size > 10_000
+    assert "Bracket" not in out["parts"] and "Base" in out["parts"]
+    with pytest.raises(ValueError, match="No solids left"):
+        server.quick_look("ql_asm.step", include=["Gearbox"])
+
+
+def test_section_zoom_writes_separate_file():
+    server.create_model("zoom_part", ASM)
+    server.section_view("zoom_part.step", plane="XZ", offset=0,
+                        zoom_min=[-5, -6], zoom_max=[15, 8])
+    assert (WORKDIR / "zoom_part_section_XZ_0_zoom.png").exists()

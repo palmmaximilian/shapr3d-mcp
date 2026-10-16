@@ -29,6 +29,9 @@ AI assistant ──MCP──▶ this server ──build123d/OCCT──▶ model.
 
 UI tools need Screen Recording and Accessibility permission for the app that
 hosts the MCP server (Shapr3D draws its own dialogs, so they are found by OCR).
+Run `check_permissions` once at the start; in Claude, the permission rule
+`mcp__shapr3d` pre-approves all tools of this server. Shapr3D ignores input
+while it is in the background, so UI tools bring it to the front briefly.
 
 | Tool | Purpose |
 |---|---|
@@ -38,6 +41,7 @@ hosts the MCP server (Shapr3D draws its own dialogs, so they are found by OCR).
 | `detect_clash` | Pairwise interference check; names assembly parts, separates `expected` overlaps (threads, hoses), reports `near_miss_mm` gaps |
 | `query_features` | Cylinders (hole/boss, radius, axis, length) and planes of a part or region - read real dimensions off vendor CAD |
 | `section_view` | 2-D cross-section PNG on XY/XZ/YZ, parts coloured, areas listed |
+| `quick_look` | One progress sheet: coloured iso + front render and a section, for showing the user as you go |
 | `diff_models` | What changed between two versions (e.g. after the user edited in Shapr3D): added/removed regions, new/removed faces |
 | `inspect_model` | Solids, bounding box, volume, face/edge counts; per-part inventory for labelled assemblies |
 | `convert_model` | Read STEP / IGES / STL / BREP / 3MF, write STEP / STL / 3MF / glTF / GLB / BREP |
@@ -49,7 +53,9 @@ hosts the MCP server (Shapr3D draws its own dialogs, so they are found by OCR).
 | `read_shapr3d_ui` | OCR the window: visible labels with their positions |
 | `click_shapr3d_text` / `click_shapr3d_at` | Click a label found by OCR, or a point from a screenshot |
 | `shapr3d_menu` | Click or list menu-bar items, e.g. `["File", "Export to", "STEP…"]` |
-| `shapr3d_keys` | Send a shortcut such as `cmd+z` or `escape` |
+| `shapr3d_keys` | Send a shortcut such as `cmd+z` or `escape`, or type text |
+| `export_from_shapr3d` | File > Export to > STEP/STL/... and fill the Save panel; focus returns to the previous app |
+| `check_permissions` | Warm-up: request Accessibility / Screen Recording / Automation once, report status |
 | `build123d_guide` | Modeling syntax cheat sheet for the AI |
 
 ## Setup

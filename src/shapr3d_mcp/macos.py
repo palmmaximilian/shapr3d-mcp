@@ -239,3 +239,103 @@ def parse_keys(combo: str) -> dict:
 
 def keys(combo: str) -> None:
     _jxa(_KEYS_JS, json.dumps(parse_keys(combo)))
+
+
+# ---------------------------------------------------------------------------
+# focus handling, typing, save panel, permissions
+# ---------------------------------------------------------------------------
+
+_FRONT_JS = """
+function run() {
+  return Application('System Events').processes.whose({frontmost: true})[0].name();
+}
+"""
+
+_ACTIVATE_JS = """
+function run(argv) { Application(argv[0]).activate(); return 'ok'; }
+"""
+
+_TYPE_JS = """
+function run(argv) { Application('System Events').keystroke(argv[0]); return 'ok'; }
+"""
+
+_WINDOWS_JS = """
+function run(argv) {
+  const p = Application('System Events').processes.byName(argv[0]);
+  return JSON.stringify(p.windows().map(w => {
+    let sr = ''; try { sr = w.subrole(); } catch (e) {}
+    return {name: w.name(), subrole: sr};
+  }));
+}
+"""
+
+_SAVE_JS = """
+function run(argv) {
+  const [name, folder] = argv;
+  const se = Application('System Events');
+  se.keystroke('a', {using: 'command down'}); delay(0.2);
+  se.keystroke(name); delay(0.3);
+  se.keystroke('g', {using: ['command down', 'shift down']}); delay(0.8);
+  se.keystroke(folder); delay(0.5);
+  se.keyCode(36); delay(1.0);   // return: go to folder
+  se.keyCode(36); delay(1.2);   // return: Save
+  return 'ok';
+}
+"""
+
+_PERMS_JS = """
+ObjC.import('ApplicationServices'); ObjC.import('CoreGraphics');
+// not in JXA's bridge metadata: bind by signature
+ObjC.bindFunction('CGPreflightScreenCaptureAccess', ['bool', []]);
+ObjC.bindFunction('CGRequestScreenCaptureAccess', ['bool', []]);
+function run(argv) {
+  const prompt = argv[0] === '1';
+  const opts = $.NSDictionary.dictionaryWithObjectForKey(
+    prompt ? $.kCFBooleanTrue : $.kCFBooleanFalse, $('AXTrustedCheckOptionPrompt'));
+  const ax = $.AXIsProcessTrustedWithOptions(opts);
+  let screen = $.CGPreflightScreenCaptureAccess();
+  if (!screen && prompt) screen = $.CGRequestScreenCaptureAccess();
+  let events = false, err = '';
+  try {   // first Apple Event to System Events triggers the Automation prompt
+    Application('System Events').processes.length; events = true;
+  } catch (e) { err = String(e); }
+  return JSON.stringify({accessibility: !!ax, screen_recording: !!screen,
+                         automation_system_events: events, error: err});
+}
+"""
+
+
+def frontmost_app() -> str:
+    return _jxa(_FRONT_JS)
+
+
+def activate_app(name: str) -> None:
+    _jxa(_ACTIVATE_JS, name)
+
+
+def type_text(text: str) -> None:
+    _jxa(_TYPE_JS, text)
+
+
+def windows() -> list[dict]:
+    return json.loads(_jxa(_WINDOWS_JS, APP_NAME) or "[]")
+
+
+def wait_for_save_dialog(timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if any(w["name"] == "Save" or w["subrole"] == "AXDialog" for w in windows()):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def fill_save_dialog(name: str, folder: str) -> None:
+    """Shapr3D's Save panel runs out of process (sandbox), so Accessibility
+    can't reach its fields; it is driven by keyboard: name, Cmd+Shift+G to
+    the folder, Save. Shapr3D must be frontmost while typing."""
+    _jxa(_SAVE_JS, name, folder, timeout=60)
+
+
+def permissions(prompt: bool) -> dict:
+    return json.loads(_jxa(_PERMS_JS, "1" if prompt else "0", timeout=60))

@@ -1,5 +1,7 @@
 """Shapr3D UI automation: pure helpers plus the tools with macOS mocked."""
 
+from pathlib import Path
+
 import pytest
 
 from shapr3d_mcp import macos, server
@@ -96,3 +98,66 @@ def test_click_at_bounds_checked(fake_mac):
     assert fake_mac["clicks"] == [(10, 54)]
     with pytest.raises(ValueError):
         server.click_shapr3d_at(5000, 20)
+
+
+# ---------------------------------------------------------------------------
+# export from Shapr3D + permissions warm-up
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_export(fake_mac, monkeypatch, tmp_path):
+    calls = {"menu": [], "activated": [], "filled": []}
+    monkeypatch.setattr(macos, "frontmost_app", lambda: "firefox")
+    monkeypatch.setattr(macos, "activate_app", lambda n: calls["activated"].append(n))
+    monkeypatch.setattr(macos, "menu", lambda p: calls["menu"].append(p))
+    monkeypatch.setattr(macos, "wait_for_save_dialog", lambda t: True)
+
+    def fill(name, folder):
+        # Shapr3D writes the file without an extension when given a bare name
+        from build123d import Box, export_step
+        calls["filled"].append((name, folder))
+        export_step(Box(3, 3, 3), str(Path(folder) / name))
+    monkeypatch.setattr(macos, "fill_save_dialog", fill)
+    return calls, tmp_path
+
+
+def test_export_from_shapr3d_saves_adds_extension_restores_focus(fake_export):
+    calls, folder = fake_export
+    out = server.export_from_shapr3d("edited part", folder=str(folder))
+    assert calls["menu"] == [["File", "Export to", "STEP…"]]
+    assert calls["filled"] == [("edited part", str(folder))]
+    assert calls["activated"] == ["firefox"]          # focus handed back
+    assert out["saved"] == str(folder / "edited part.step")
+    assert out["summary"]["solids"] == 1
+
+
+def test_export_without_dialog_reports_labels(fake_export, monkeypatch):
+    monkeypatch.setattr(macos, "wait_for_save_dialog", lambda t: False)
+    monkeypatch.setattr(macos, "read_ui", lambda out: (WIN, [item("Export Options", 800, 400)]))
+    with pytest.raises(RuntimeError, match="Export Options"):
+        server.export_from_shapr3d("x", folder=str(fake_export[1]))
+
+
+def test_export_rejects_unknown_format(fake_mac):
+    with pytest.raises(ValueError, match="fmt must be"):
+        server.export_from_shapr3d("x", fmt="dwg")
+
+
+def test_check_permissions_reports_missing(monkeypatch):
+    monkeypatch.setattr(macos, "permissions", lambda prompt: {
+        "accessibility": True, "screen_recording": False,
+        "automation_system_events": True, "error": ""})
+    monkeypatch.setattr(macos, "is_running", lambda: False)
+    out = server.check_permissions(prompt=False)
+    assert out["ready"] is False and "screen_recording" in out["todo"]
+    assert "mcp__shapr3d" in out["claude_tool_approvals"]
+
+
+def test_keys_types_text(fake_mac, monkeypatch):
+    typed = []
+    monkeypatch.setattr(macos, "type_text", typed.append)
+    monkeypatch.setattr(macos, "keys", lambda c: typed.append(f"<{c}>"))
+    server.shapr3d_keys(combo="return", text="12.5")
+    assert typed == ["12.5", "<return>"]
+    with pytest.raises(ValueError):
+        server.shapr3d_keys()

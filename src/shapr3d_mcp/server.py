@@ -37,9 +37,15 @@ mcp = FastMCP(
         "Controls a CAD modeling workflow around Shapr3D. Shapr3D has no "
         "scripting API, so models are built with build123d (OpenCascade) and "
         "exchanged as STEP files, which Shapr3D opens as editable solid bodies. "
-        "Typical flow: create_model -> open_in_shapr3d -> user edits in app -> "
-        "user exports STEP -> inspect_model / modify_model. Call "
-        "build123d_guide first if you are unsure of build123d syntax."
+        "Typical flow: create_model / run_model_file -> open_in_shapr3d -> user edits in app -> "
+        "export_from_shapr3d -> diff_models / modify_model. Call "
+        "build123d_guide first if you are unsure of build123d syntax. "
+        "Before using any Shapr3D UI tool, call check_permissions once so the "
+        "user approves macOS prompts up front. After each meaningful model "
+        "change, call quick_look and show the PNG to the user - they only "
+        "see images you send them. Modeling, checks and renders run in the "
+        "CAD kernel and never need the Shapr3D window; UI tools briefly take "
+        "focus, so batch them."
     ),
 )
 
@@ -674,32 +680,16 @@ def query_features(path: str, part: str | None = None,
             "truncated": len(feats) >= max_results}
 
 
-@mcp.tool()
-def section_view(path: str, plane: str = "XZ", offset: float = 0.0,
-                 width: int = 900, height: int = 900) -> Image:
-    """Cut the model with a plane and draw the cross-section in 2-D (parts
-    coloured separately, mm grid). Shows wall thickness, internal channels
-    and whether cuts really happened - things a shaded render hides.
-
-    Args:
-        plane: "XY", "XZ" or "YZ".
-        offset: Plane position along its normal (mm), e.g. y=0 for XZ.
-    """
+def _section_png(entries: list[dict], bbox, plane: str, offset: float, out: Path,
+                 width: int, height: int, zoom_min=None, zoom_max=None) -> Path:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import PathPatch
     from matplotlib.path import Path as MPath
 
-    src = _resolve(path)
-    if not src.exists():
-        raise FileNotFoundError(f"No such file: {src}")
-    shape = _import_any(src)
-    entries = kernel.labelled_solids(shape, src.name)
     pl = kernel.section_plane(plane, offset)
-    bb = shape.bounding_box()
-    size = 4 * max(bb.size.X, bb.size.Y, bb.size.Z, 1.0)
-
+    size = 4 * max(bbox.size.X, bbox.size.Y, bbox.size.Z, 1.0)
     fig, ax = plt.subplots(figsize=(width / 100, height / 100), dpi=100)
     palette = plt.get_cmap("tab10")
     parts, colours, areas = [], {}, {}
@@ -722,6 +712,9 @@ def section_view(path: str, plane: str = "XZ", offset: float = 0.0,
         plt.close(fig)
         raise ValueError(f"Plane {plane} at {offset} mm does not cut the model")
     ax.autoscale_view()
+    if zoom_min and zoom_max:
+        ax.set_xlim(zoom_min[0], zoom_max[0])
+        ax.set_ylim(zoom_min[1], zoom_max[1])
     ax.set_aspect("equal")
     ax.grid(True, linewidth=0.3)
     axes = {"XY": ("X", "Y"), "XZ": ("X", "Z"), "YZ": ("Y", "Z")}[plane.upper()]
@@ -732,10 +725,97 @@ def section_view(path: str, plane: str = "XZ", offset: float = 0.0,
     handles = [plt.Rectangle((0, 0), 1, 1, color=colours[p]) for p in parts]
     ax.legend(handles, [f"{p} ({areas[p]:.0f} mm²)" for p in parts], fontsize=7,
               loc="upper left", bbox_to_anchor=(1.01, 1))
-    out = WORKDIR / f"{_safe_name(src.stem)}_section_{plane.upper()}_{offset:g}.png"
     fig.savefig(out, bbox_inches="tight", pad_inches=0.1)
     plt.close(fig)
+    return out
+
+
+def _select(entries: list[dict], include: list[str] | None, exclude: list[str] | None) -> list[dict]:
+    if include:
+        entries = [e for e in entries if any(kernel.norm(p) in kernel.norm(e["ref"]) for p in include)]
+    if exclude:
+        entries = [e for e in entries if not any(kernel.norm(p) in kernel.norm(e["ref"]) for p in exclude)]
+    if not entries:
+        raise ValueError("No solids left after include/exclude filters")
+    return entries
+
+
+@mcp.tool()
+def section_view(path: str, plane: str = "XZ", offset: float = 0.0,
+                 width: int = 900, height: int = 900,
+                 zoom_min: list[float] | None = None,
+                 zoom_max: list[float] | None = None) -> Image:
+    """Cut the model with a plane and draw the cross-section in 2-D (parts
+    coloured separately, mm grid). Shows wall thickness, internal channels
+    and whether cuts really happened - things a shaded render hides.
+
+    Args:
+        plane: "XY", "XZ" or "YZ".
+        offset: Plane position along its normal (mm), e.g. y=0 for XZ.
+        zoom_min / zoom_max: [u, v] corners in the section's own axes
+            (e.g. [x, z] for XZ) to zoom into a detail.
+    """
+    src = _resolve(path)
+    if not src.exists():
+        raise FileNotFoundError(f"No such file: {src}")
+    shape = _import_any(src)
+    tag = "_zoom" if zoom_min and zoom_max else ""
+    out = WORKDIR / f"{_safe_name(src.stem)}_section_{plane.upper()}_{offset:g}{tag}.png"
+    _section_png(kernel.labelled_solids(shape, src.name), shape.bounding_box(), plane,
+                 offset, out, width, height, zoom_min, zoom_max)
     return Image(path=str(out))
+
+
+@mcp.tool()
+def quick_look(path: str, include: list[str] | None = None,
+               exclude: list[str] | None = None, plane: str = "XZ",
+               offset: float = 0.0) -> dict:
+    """One progress picture: iso + front render and a cross-section side by
+    side, written to <name>_quicklook.png. Call it after every meaningful
+    change and SHOW THE PNG TO THE USER (e.g. send the file) - they cannot
+    see tool images, and progress pictures let them steer early.
+
+    Args:
+        include / exclude: Part-name filters (substrings of assembly labels),
+            e.g. exclude=["VGC10"] to keep big vendor parts out of the render
+            (the section still uses everything not excluded).
+        plane / offset: Section plane, as in section_view.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.image as mpimg
+    import matplotlib.pyplot as plt
+    from build123d import Compound
+
+    src = _resolve(path)
+    if not src.exists():
+        raise FileNotFoundError(f"No such file: {src}")
+    shape = _import_any(src)
+    entries = _select(kernel.labelled_solids(shape, src.name), include, exclude)
+    sub = Compound(children=[e["solid"] for e in entries])
+    stem = _safe_name(src.stem)
+    with tempfile.TemporaryDirectory() as td:
+        views = Path(td) / "views.png"
+        sec = Path(td) / "section.png"
+        palette = plt.get_cmap("tab10")
+        names = list(dict.fromkeys(e["part"] for e in entries))  # section order
+        groups = [(Compound(children=[e["solid"] for e in entries if e["part"] == n]),
+                   palette(i % 10)[:3]) for i, n in enumerate(names)]
+        _render_png(sub, views, [("iso", 25, -60, False), ("front", 0, -90, True)],
+                    1000, 900, False, parts=groups)
+        _section_png(entries, sub.bounding_box(), plane, offset, sec, 800, 900)
+        fig, axs = plt.subplots(1, 2, figsize=(18, 9), dpi=100,
+                                gridspec_kw={"width_ratios": [1.1, 1]})
+        for ax, img in zip(axs, (views, sec)):
+            ax.imshow(mpimg.imread(img))
+            ax.set_axis_off()
+        fig.suptitle(f"{src.name} - {len(entries)} solids", fontsize=12)
+        out = WORKDIR / f"{stem}_quicklook.png"
+        fig.savefig(out, bbox_inches="tight", pad_inches=0.1)
+        plt.close(fig)
+    return {"image": str(out),
+            "parts": sorted({e["part"] for e in entries}),
+            "next_step": "Send this PNG to the user so they can see progress."}
 
 
 @mcp.tool()
@@ -843,16 +923,31 @@ def render_preview(path: str, width: int = 800, height: int = 600,
     return Image(path=str(out))
 
 
-def _render_png(shape, out: Path, cams: list[tuple], width: int, height: int,
-                edges: bool) -> None:
-    # Render via STL -> matplotlib (no GPU/display needed)
-    import numpy as np
+DEFAULT_RGB = (0.35, 0.55, 0.85)
 
+
+def _render_png(shape, out: Path, cams: list[tuple], width: int, height: int,
+                edges: bool, parts: list[tuple] | None = None) -> None:
+    """Render via STL -> matplotlib (no GPU/display needed). `parts` is an
+    optional [(shape, rgb)] list to colour assembly parts separately."""
+    import numpy as np
+    from build123d import export_stl
+
+    parts = parts or [(shape, DEFAULT_RGB)]
+    # tessellate to roughly pixel size: the default 0.001 mm tolerance
+    # turns vendor CAD into millions of triangles matplotlib crawls on
+    diag = shape.bounding_box().diagonal
+    tri_list, nrm_list, rgb_list = [], [], []
     with tempfile.TemporaryDirectory() as td:
-        stl_path = Path(td) / "preview.stl"
-        from build123d import export_stl
-        export_stl(shape, str(stl_path))
-        tris, normals = _read_binary_stl(stl_path)
+        for k, (part, rgb) in enumerate(parts):
+            stl_path = Path(td) / f"p{k}.stl"
+            export_stl(part, str(stl_path), tolerance=max(diag / 3000, 0.002),
+                       angular_tolerance=0.25)
+            t, n = _read_binary_stl(stl_path)
+            tri_list.append(t)
+            nrm_list.append(n)
+            rgb_list.append(np.tile(np.array(rgb, dtype=float), (len(t), 1)))
+    tris, normals, base_rgb = (np.concatenate(x) for x in (tri_list, nrm_list, rgb_list))
 
     import matplotlib
     matplotlib.use("Agg")
@@ -888,7 +983,7 @@ def _render_png(shape, out: Path, cams: list[tuple], width: int, height: int,
         light = cam + 0.35 * np.array([-np.sin(a), np.cos(a), 0.6])
         light = light / np.linalg.norm(light)
         shade = 0.3 + 0.7 * np.clip(normals @ light, 0, 1)
-        colors = np.outer(shade, np.array([0.35, 0.55, 0.85]))
+        colors = base_rgb * shade[:, None]
         # Stroke each triangle in its own colour: with edgecolor="none" the
         # antialiased gaps between triangles show up as light seams.
         coll = Poly3DCollection(
@@ -899,9 +994,11 @@ def _render_png(shape, out: Path, cams: list[tuple], width: int, height: int,
             ax.add_collection3d(
                 Line3DCollection(edge_lines, colors="#111111", linewidths=0.6)
             )
-        ax.set_xlim(center[0] - span, center[0] + span)
-        ax.set_ylim(center[1] - span, center[1] + span)
-        ax.set_zlim(center[2] - span, center[2] + span)
+        # box aspect = real extents, so tall/flat parts fill the frame
+        ext = np.maximum(size, 1e-3 * max(size.max(), 1))
+        for setter, c, h in zip((ax.set_xlim, ax.set_ylim, ax.set_zlim), center, ext / 2):
+            setter(c - h, c + h)
+        ax.set_box_aspect(ext, zoom=1.0)
         ax.set_axis_off()
         ax.view_init(elev=elev, azim=azim)
         if len(cams) > 1 or label != "iso":
@@ -1138,14 +1235,117 @@ def shapr3d_menu(path: list[str] | None = None, click: bool = True) -> dict:
 
 
 @mcp.tool()
-def shapr3d_keys(combo: str) -> dict:
-    """Send a keyboard shortcut to Shapr3D, e.g. "cmd+z", "escape", "return",
-    "cmd+shift+s", "delete". Brings Shapr3D to the front."""
+def shapr3d_keys(combo: str | None = None, text: str | None = None) -> dict:
+    """Send a keyboard shortcut to Shapr3D ("cmd+z", "escape", "return",
+    "cmd+shift+s", "delete") and/or type text (e.g. a value into a focused
+    field). Brings Shapr3D to the front."""
     _require_running()
-    parsed = macos.parse_keys(combo)  # validate before focusing the app
+    if not combo and text is None:
+        raise ValueError("Give a combo, text, or both")
+    parsed = macos.parse_keys(combo) if combo else None  # validate first
     macos.activate()
-    macos.keys(combo)
-    return {"sent": combo, "parsed": parsed}
+    if text is not None:
+        macos.type_text(text)
+    if combo:
+        macos.keys(combo)
+    return {"sent": combo, "typed": text, "parsed": parsed}
+
+
+EXPORT_MENU = {
+    "step": "STEP…", "stl": "STL…", "3mf": "3MF…", "iges": "IGES…",
+    "glb": "GLB…", "obj": "OBJ…", "usdz": "USDZ…", "x_t": "Parasolid file…",
+    "shapr": "Shapr3D…",
+}
+EXPORT_EXT = {"x_t": "x_t", "iges": "igs"}
+
+
+@mcp.tool()
+def export_from_shapr3d(name: str, fmt: str = "step", folder: str | None = None,
+                        timeout_s: float = 15) -> dict:
+    """Export the open Shapr3D project (File > Export to > <format>) and save
+    it, so you can inspect / diff / modify what the user built or changed in
+    the app. Shapr3D takes focus for ~3 s while the Save panel is filled in,
+    then focus returns to the previously active app.
+
+    Args:
+        name: File name without extension.
+        fmt: step (default), stl, 3mf, iges, glb, obj, usdz, x_t, shapr.
+        folder: Target folder; default the models workspace.
+    Returns the saved path (extension added if Shapr3D left it off) and,
+    for CAD formats, inspect_model's summary.
+    """
+    _require_running()
+    fmt = fmt.lower().lstrip(".")
+    if fmt not in EXPORT_MENU:
+        raise ValueError(f"fmt must be one of {sorted(EXPORT_MENU)}")
+    dest = Path(folder).expanduser() if folder else WORKDIR
+    dest.mkdir(parents=True, exist_ok=True)
+    safe = _safe_name(name)
+    ext = EXPORT_EXT.get(fmt, fmt)
+    before = {p for p in dest.iterdir()} if dest.exists() else set()
+    previous = macos.frontmost_app()
+    macos.menu(["File", "Export to", EXPORT_MENU[fmt]])
+    if not macos.wait_for_save_dialog(timeout_s):
+        _, items = macos.read_ui(WORKDIR / "_shapr3d_ui.png")
+        raise RuntimeError(
+            "No Save dialog appeared (Shapr3D may show export options first, "
+            "or be in a mode that blocks export). Visible labels: "
+            f"{sorted({i['text'] for i in items})[:40]}"
+        )
+    try:
+        macos.activate()
+        macos.fill_save_dialog(safe, str(dest))
+    finally:
+        if previous and previous != APP_NAME:
+            macos.activate_app(previous)
+    deadline = time.monotonic() + 30
+    saved = None
+    while time.monotonic() < deadline and saved is None:
+        for cand in (dest / f"{safe}.{ext}", dest / safe):
+            if cand.exists() and cand not in before and cand.stat().st_size > 0:
+                saved = cand
+                break
+        else:
+            time.sleep(0.5)
+    if saved is None:
+        raise RuntimeError(f"Export did not appear in {dest} within 30 s")
+    if saved.suffix.lower() != f".{ext}":
+        final = saved.with_name(f"{safe}.{ext}")
+        saved.rename(final)  # Shapr3D omits the extension when typed by name
+        saved = final
+    out = {"saved": str(saved), "focus_returned_to": previous}
+    if fmt in {"step", "stl", "3mf", "iges"}:
+        info = inspect_model(str(saved))
+        out["summary"] = {k: info[k] for k in ("solids", "volume_mm3", "bounding_box_mm") if k in info}
+    return out
+
+
+@mcp.tool()
+def check_permissions(prompt: bool = True) -> dict:
+    """Warm-up: check (and with prompt=True, request) every macOS permission
+    the Shapr3D UI tools need - Accessibility, Screen Recording, control of
+    System Events - so the user approves them once at the start instead of
+    mid-task. Model tools (create/inspect/clash/render...) need none.
+
+    Claude's own per-tool approvals are separate: one allow rule
+    "mcp__shapr3d" in Claude's settings covers all tools of this server.
+    """
+    status = macos.permissions(prompt)
+    missing = [k for k in ("accessibility", "screen_recording", "automation_system_events")
+               if not status.get(k)]
+    status["shapr3d_running"] = macos.is_running()
+    status["ready"] = not missing
+    if missing:
+        status["todo"] = (
+            f"Grant {', '.join(missing)} to the app hosting this server "
+            "(System Settings > Privacy & Security), then restart it. "
+            "Screen Recording changes only apply after a restart."
+        )
+    status["claude_tool_approvals"] = (
+        "Allow rule 'mcp__shapr3d' (Claude settings, permissions.allow) "
+        "pre-approves every tool of this server."
+    )
+    return status
 
 
 # ---------------------------------------------------------------------------
