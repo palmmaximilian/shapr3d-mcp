@@ -79,7 +79,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
    4 mounting holes for M5 bolts").
 2. It writes a build123d script via `create_model`, checks it with
    `render_preview`, and opens the STEP in Shapr3D via `open_in_shapr3d`.
-3. You confirm the Import Preferences dialog in Shapr3D (Quality is fine;
+3. You answer Shapr3D's "Import to" dialog (Current Project / New Project;
    STEP carries mm units) and edit freely — the bodies are native,
    editable solids.
 4. To AI-edit an existing design: export STEP from Shapr3D, then ask the AI
