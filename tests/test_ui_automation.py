@@ -141,3 +141,48 @@ def test_keys_types_text(fake_mac, monkeypatch):
     assert typed == ["12.5", "<return>"]
     with pytest.raises(ValueError):
         server.shapr3d_keys()
+
+
+# ---------------------------------------------------------------------------
+# open_in_shapr3d: iterate in the open project unless asked for a new one
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_import(monkeypatch):
+    scripts = []
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(server.time, "sleep", lambda s: None)
+    monkeypatch.setattr(server, "_osascript", lambda sc: scripts.append(sc) or "")
+    monkeypatch.setattr(server, "_shapr3d_history_mentions", lambda needle: True)
+    server.create_model("iterate_me", "result = Box(5, 5, 5)")
+    return scripts
+
+
+def _menu(items):
+    return lambda path: items
+
+
+def test_open_imports_into_open_project_by_default(fake_import, monkeypatch):
+    monkeypatch.setattr(macos, "menu_items", _menu(["New Project", "Import File…", "Export to"]))
+    msg = server.open_in_shapr3d("iterate_me.step")
+    assert 'keystroke "n"' not in fake_import[0] and "the current" in msg
+
+
+def test_open_creates_project_from_home_screen(fake_import, monkeypatch):
+    monkeypatch.setattr(macos, "menu_items", _menu(["New Project", "Import as new project…"]))
+    msg = server.open_in_shapr3d("iterate_me.step")
+    assert 'keystroke "n"' in fake_import[0] and "a new" in msg
+
+
+def test_open_new_project_only_when_asked(fake_import, monkeypatch):
+    monkeypatch.setattr(macos, "menu_items", _menu(["Import File…"]))
+    server.open_in_shapr3d("iterate_me.step", new_project=True)
+    assert 'keystroke "n"' in fake_import[0]
+
+
+def test_unreadable_menu_never_starts_new_project(fake_import, monkeypatch):
+    def boom(path):
+        raise RuntimeError("no access")
+    monkeypatch.setattr(macos, "menu_items", boom)
+    server.open_in_shapr3d("iterate_me.step")
+    assert 'keystroke "n"' not in fake_import[0]

@@ -591,6 +591,17 @@ def _activate_app() -> None:
         )
 
 
+def _project_is_open() -> bool:
+    """A project is open when the File menu offers "Import File…"; on the
+    home screen it only has "Import as new project…". If the menu can't be
+    read, assume a project is open (never silently start a new one)."""
+    try:
+        items = macos.menu_items(["File"])
+    except Exception:
+        return True
+    return any(i.startswith("Import File") for i in items)
+
+
 def _shapr3d_history_mentions(needle: str) -> bool:
     """Check Shapr3D's own accessibility tree for a History entry containing
     `needle`. This is real verification, not a timing guess: Shapr3D exposes
@@ -1307,7 +1318,7 @@ IMPORT_DIALOG_NOTE = (
 
 
 @mcp.tool()
-def open_in_shapr3d(path: str, new_project: bool = True) -> str:
+def open_in_shapr3d(path: str, new_project: bool | None = None) -> str:
     """Open a CAD file in Shapr3D as a real editable body.
 
     Verified against Shapr3D 26.143.0 - two things the original approach got
@@ -1322,9 +1333,10 @@ def open_in_shapr3d(path: str, new_project: bool = True) -> str:
     2. The only flow that imports deterministically is the in-app menu: File >
        Import File... (Shift-Cmd-I) from a known project state, then the
        standard macOS open panel's go-to-folder (Shift-Cmd-G) to jump straight
-       to the file. So this function always starts from an explicit New
-       Project (Cmd-N) rather than relying on `open -a` with a path argument,
-       which sidesteps the ambiguous native dialog entirely.
+       to the file. So this function drives that menu (into the open
+       project, or a new one via Cmd-N - see new_project) rather than
+       relying on `open -a` with a path argument, which sidesteps the
+       ambiguous native dialog entirely.
 
     Requires the calling app to have Accessibility + Automation (System
     Events) permission in System Settings > Privacy & Security - macOS will
@@ -1332,8 +1344,11 @@ def open_in_shapr3d(path: str, new_project: bool = True) -> str:
 
     Args:
         path: File to import (STEP preferred - imports as an editable body).
-        new_project: Start a fresh project before importing (default True).
-            Set False to import into whatever project is already frontmost.
+        new_project: Default (None): import into the project that is open,
+            so models are iterated on in place; only on Shapr3D's home
+            screen (no project open) a new project is created. Pass True
+            ONLY when the user asks to start a new model/project; False
+            forces the current project.
 
     Raises:
         RuntimeError: if the History panel doesn't show this file as imported
@@ -1365,6 +1380,9 @@ def open_in_shapr3d(path: str, new_project: bool = True) -> str:
         )
 
     import time
+
+    if new_project is None and sys.platform == "darwin":
+        new_project = not _project_is_open()
 
     def _attempt() -> None:
         subprocess.run(["open", "-a", APP_NAME], check=True, timeout=15)
