@@ -17,10 +17,13 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
+
+from shapr3d_mcp import macos
 
 # build123d logs verbosely at INFO; anything reaching stdout would corrupt
 # the MCP stdio transport, so clamp it before the kernel is imported.
@@ -67,17 +70,23 @@ def _resolve(path: str) -> Path:
     return p
 
 
+def _quiet_occt() -> None:
+    # OCCT's readers print transfer chatter (and "*** ERR StepReaderData"
+    # lines for slightly broken vendor STEP files) to fd 1, which would
+    # corrupt the MCP stdio transport; clamp it like build123d's exporters do.
+    from OCP.Message import Message, Message_Gravity
+
+    for printer in Message.DefaultMessenger_s().Printers():
+        printer.SetTraceLevel(Message_Gravity(Message_Gravity.Message_Fail))
+
+
 def _import_iges(path: Path):
     # build123d has no import_iges; read via OCP and wrap like import_brep does.
     from build123d import Compound
     from OCP.IFSelect import IFSelect_RetDone
     from OCP.IGESControl import IGESControl_Reader
-    from OCP.Message import Message, Message_Gravity
 
-    # OCCT's reader prints transfer chatter to fd 1, which would corrupt the
-    # MCP stdio transport; clamp it like build123d's exporters do.
-    for printer in Message.DefaultMessenger_s().Printers():
-        printer.SetTraceLevel(Message_Gravity(Message_Gravity.Message_Fail))
+    _quiet_occt()
 
     reader = IGESControl_Reader()
     if reader.ReadFile(str(path)) != IFSelect_RetDone:
@@ -94,6 +103,7 @@ def _import_any(path: Path):
 
     suffix = path.suffix.lower()
     if suffix in {".step", ".stp"}:
+        _quiet_occt()
         return import_step(str(path))
     if suffix == ".stl":
         # import_stl returns one triangulation-only Face with no surface:
@@ -680,20 +690,52 @@ def list_models() -> list[dict]:
 # Shapr3D app bridge (macOS)
 # ---------------------------------------------------------------------------
 
+IMPORT_CHOICES = {"current": "Current Project", "new": "New Project"}
+
+
 @mcp.tool()
-def open_in_shapr3d(path: str) -> str:
+def open_in_shapr3d(path: str, import_to: str | None = None,
+                    timeout_s: float = 12) -> dict:
     """Open a CAD file in Shapr3D. STEP files import as editable solid
-    bodies; Shapr3D shows an import dialog where the user confirms units."""
+    bodies.
+
+    With a project open, Shapr3D asks "Import to" Current Project / New
+    Project / Cancel. Pass import_to="current" or "new" to answer it
+    automatically (found by OCR and clicked); leave it unset to let the
+    user choose. If the project is empty Shapr3D may import directly.
+    """
     src = _resolve(path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
+    if import_to is not None and import_to not in IMPORT_CHOICES:
+        raise ValueError(f"import_to must be one of {sorted(IMPORT_CHOICES)} or None")
     subprocess.run(["open", "-a", APP_NAME, str(src)], check=True, timeout=15)
-    return (
-        f"Sent {src.name} to Shapr3D. With a project open, the app asks "
-        "'Import to' Current Project / New Project / Cancel; the user picks "
-        "one (it may then show import quality options). STEP files carry "
-        "their units (mm), so no unit choice is needed."
-    )
+    if import_to is None:
+        return {
+            "sent": src.name,
+            "note": "If a project is open, Shapr3D asks 'Import to' Current "
+                    "Project / New Project; the user (or click_shapr3d_text) "
+                    "answers it.",
+        }
+    label = IMPORT_CHOICES[import_to]
+    deadline = time.monotonic() + timeout_s
+    shot = WORKDIR / "_shapr3d_ui.png"
+    while time.monotonic() < deadline:
+        time.sleep(1.0)
+        win, items = macos.read_ui(shot)
+        if not macos.match_text("Where do you want to import", items):
+            continue
+        hit = macos.match_text(label, items)
+        if hit:
+            macos.activate()
+            macos.click_screen(hit["screen_x"], hit["screen_y"])
+            return {"sent": src.name, "import_to": label, "clicked": hit}
+    return {
+        "sent": src.name,
+        "import_to": None,
+        "note": f"No 'Import to' dialog seen within {timeout_s:.0f} s - an "
+                "empty project imports directly. Check with screenshot_shapr3d.",
+    }
 
 
 @mcp.tool()
@@ -733,27 +775,115 @@ def activate_shapr3d() -> str:
     return "Shapr3D activated."
 
 
+def _require_running() -> None:
+    if not macos.is_running():
+        raise RuntimeError("Shapr3D is not running. Call activate_shapr3d first.")
+
+
 @mcp.tool()
 def screenshot_shapr3d() -> Image:
-    """Capture a screenshot of the Shapr3D window to see the current state
-    of the model/app. Requires Screen Recording permission for the host
-    process the first time."""
-    if subprocess.run(["pgrep", "-x", APP_NAME], capture_output=True).returncode != 0:
-        raise RuntimeError("Shapr3D is not running. Call activate_shapr3d first.")
-    try:
-        bounds = _osascript(
-            f'tell application "System Events" to tell process "{APP_NAME}" to '
-            "get {position, size} of front window"
-        )
-        x, y, w, h = [int(v.strip()) for v in bounds.split(",")]
-        region = ["-R", f"{x},{y},{w},{h}"]
-    except Exception:
-        region = []  # fall back to full screen
+    """Capture the Shapr3D window (even when other windows cover it). The
+    image is scaled to window points, so its pixel coordinates can be
+    passed straight to click_shapr3d_at. Needs Screen Recording permission
+    for the host process."""
+    _require_running()
     out = WORKDIR / "_shapr3d_screenshot.png"
-    subprocess.run(
-        ["screencapture", "-x", *region, str(out)], check=True, timeout=15
-    )
+    macos.capture(out)
     return Image(path=str(out))
+
+
+@mcp.tool()
+def read_shapr3d_ui(contains: str | None = None) -> dict:
+    """OCR the Shapr3D window: every visible text label with its centre in
+    window points (x, y; same frame as screenshot_shapr3d). Use it to find
+    buttons, dialog options and tool names before clicking.
+
+    Args:
+        contains: Optional case-insensitive filter on the label text.
+    """
+    _require_running()
+    win, items = macos.read_ui(WORKDIR / "_shapr3d_ui.png")
+    if contains:
+        items = [i for i in items if contains.lower() in i["text"].lower()]
+    return {
+        "window_points": [win["w"], win["h"]],
+        "labels": [{k: i[k] for k in ("text", "x", "y")} for i in items],
+    }
+
+
+@mcp.tool()
+def click_shapr3d_text(text: str, occurrence: int = 1, wait_s: float = 0) -> dict:
+    """Click a visible text label in Shapr3D (button, dialog option, tool or
+    list item), located by OCR. Exact matches beat substring matches;
+    `occurrence` picks the n-th match top-to-bottom. `wait_s` keeps looking
+    for the label that long (e.g. for a dialog that is still opening).
+    Brings Shapr3D to the front."""
+    _require_running()
+    deadline = time.monotonic() + wait_s
+    shot = WORKDIR / "_shapr3d_ui.png"
+    while True:
+        _, items = macos.read_ui(shot)
+        hit = macos.match_text(text, items, occurrence)
+        if hit or time.monotonic() >= deadline:
+            break
+        time.sleep(0.8)
+    if not hit:
+        seen = sorted({i["text"] for i in items})[:60]
+        raise RuntimeError(f"'{text}' not found on screen. Visible labels: {seen}")
+    macos.activate()
+    macos.click_screen(hit["screen_x"], hit["screen_y"])
+    return {"clicked": hit["text"], "at_window_points": [hit["x"], hit["y"]]}
+
+
+@mcp.tool()
+def click_shapr3d_at(x: float, y: float) -> dict:
+    """Click at window coordinates in points (the pixel coordinates of a
+    screenshot_shapr3d image) - for icons without a text label. Brings
+    Shapr3D to the front."""
+    _require_running()
+    win = macos.window()
+    if not (0 <= x <= win["w"] and 0 <= y <= win["h"]):
+        raise ValueError(f"({x}, {y}) is outside the {win['w']}x{win['h']} window")
+    macos.activate()
+    macos.click_screen(win["x"] + x, win["y"] + y)
+    return {"clicked_window_points": [x, y]}
+
+
+@mcp.tool()
+def shapr3d_menu(path: list[str] | None = None, click: bool = True) -> dict:
+    """Use Shapr3D's menu bar, e.g. ["File", "Export to", "STEP…"] or
+    ["Edit", "Undo"]. Menu names must match exactly (note the "…"
+    ellipsis character). With click=False, or a path ending at a menu,
+    lists the items under that path instead (empty path = top menus)."""
+    _require_running()
+    path = path or []
+    if click and path:
+        try:
+            macos.activate()
+            macos.menu(path)
+            return {"clicked": path}
+        except RuntimeError as err:
+            if "Can't get" not in str(err) and "Invalid index" not in str(err):
+                raise
+            # fall through: show what exists at the deepest valid level
+    for depth in range(len(path), -1, -1):
+        try:
+            return {"path": path[:depth], "items": macos.menu_items(path[:depth]),
+                    **({"error": f"'{path[depth]}' not found here"} if depth < len(path) else {})}
+        except RuntimeError:
+            continue
+    raise RuntimeError("Could not read the Shapr3D menu bar.")
+
+
+@mcp.tool()
+def shapr3d_keys(combo: str) -> dict:
+    """Send a keyboard shortcut to Shapr3D, e.g. "cmd+z", "escape", "return",
+    "cmd+shift+s", "delete". Brings Shapr3D to the front."""
+    _require_running()
+    parsed = macos.parse_keys(combo)  # validate before focusing the app
+    macos.activate()
+    macos.keys(combo)
+    return {"sent": combo, "parsed": parsed}
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,9 @@ AI assistant ──MCP──▶ this server ──build123d/OCCT──▶ model.
 
 ## Tools
 
+UI tools need Screen Recording and Accessibility permission for the app that
+hosts the MCP server (Shapr3D draws its own dialogs, so they are found by OCR).
+
 | Tool | Purpose |
 |---|---|
 | `create_model` | Build a model from a build123d script (optionally fed by a shared `params_file`), export STEP/STL/3MF/glTF/GLB/BREP |
@@ -34,11 +37,15 @@ AI assistant ──MCP──▶ this server ──build123d/OCCT──▶ model.
 | `detect_clash` | Pairwise interference check between solids (assembly/keep-out verification) |
 | `inspect_model` | Solids, bounding box, volume, face/edge counts of a STEP/IGES/STL/BREP/3MF file |
 | `convert_model` | Read STEP / IGES / STL / BREP / 3MF, write STEP / STL / 3MF / glTF / GLB / BREP |
-| `render_preview` | Shaded isometric PNG preview without opening any app |
+| `render_preview` | Shaded PNG preview (iso / standard views / custom angle, optional edge overlay) without opening any app |
 | `list_models` | List files in the models workspace |
-| `open_in_shapr3d` | Open a file in Shapr3D (STEP imports as editable bodies) |
+| `open_in_shapr3d` | Open a file in Shapr3D (STEP imports as editable bodies); `import_to="current"/"new"` answers the import dialog |
 | `activate_shapr3d` / `shapr3d_status` | Launch / check the app |
-| `screenshot_shapr3d` | Capture the Shapr3D window |
+| `screenshot_shapr3d` | Capture the Shapr3D window by id (works when covered), scaled to window points |
+| `read_shapr3d_ui` | OCR the window: visible labels with their positions |
+| `click_shapr3d_text` / `click_shapr3d_at` | Click a label found by OCR, or a point from a screenshot |
+| `shapr3d_menu` | Click or list menu-bar items, e.g. `["File", "Export to", "STEP…"]` |
+| `shapr3d_keys` | Send a shortcut such as `cmd+z` or `escape` |
 | `build123d_guide` | Modeling syntax cheat sheet for the AI |
 
 ## Setup

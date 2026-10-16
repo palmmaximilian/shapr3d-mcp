@@ -91,10 +91,32 @@ def test_render_preview_of_stl():
     assert png.exists() and png.stat().st_size > 1000
 
 
-def test_open_in_shapr3d_message_matches_import_dialog(monkeypatch):
-    server.create_model("open_me", HOLED_SCRIPT)
-    calls = []
-    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: calls.append(a))
-    msg = server.open_in_shapr3d("open_me.step")
-    assert calls and calls[0][0][:3] == ["open", "-a", server.APP_NAME]
-    assert "Current Project" in msg and "New Project" in msg
+def test_step_import_keeps_stdout_clean():
+    # Vendor STEP files with an unresolved reference make OCCT print
+    # "*** ERR StepReaderData" to fd 1, which corrupts the MCP stdio
+    # transport. Fresh process: earlier exports would mask the leak.
+    import subprocess
+    import sys
+
+    from build123d import Box, export_step
+
+    clean = WORKDIR / "noisy_src.step"
+    export_step(Box(5, 5, 5), str(clean))
+    text = clean.read_text().replace(
+        "ENDSEC;\nEND-ISO", "#999990 = CARTESIAN_POINT ( 'bad', #888888 ) ;\nENDSEC;\nEND-ISO"
+    )
+    assert "#999990" in text
+    noisy = WORKDIR / "noisy.step"
+    noisy.write_text(text)
+
+    code = (
+        "from pathlib import Path\n"
+        "from shapr3d_mcp import server\n"
+        f"server._import_any(Path({str(noisy)!r}))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True,
+        env={**os.environ, "SHAPR3D_MCP_WORKDIR": str(WORKDIR)}, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr.decode()
+    assert proc.stdout == b"", f"stdout not clean: {proc.stdout!r}"
