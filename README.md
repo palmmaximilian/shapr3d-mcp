@@ -37,7 +37,8 @@ forward briefly. Run `check_permissions` once at the start.
 | `create_model` | Build a model from a build123d script (optionally fed by a shared `params_file`), export STEP/STL/3MF/glTF/GLB/BREP |
 | `modify_model` | Import an existing file (e.g. Shapr3D STEP export), edit it in code, re-export |
 | `run_model_file` | Build from a script file (versionable), with `load_cad` (cached vendor CAD), `include`, `export_part`, checked `cut`/`fuse` |
-| `detect_clash` | Pairwise interference check; names assembly parts, separates `expected` overlaps (threads, hoses), reports `near_miss_mm` gaps |
+| `detect_clash` | Mesh-based pairwise interference check (seconds, also for vendor assemblies); names assembly parts, separates `expected` overlaps (threads, hoses), reports `near_miss_mm` gaps |
+| `mass_properties` | Mass, centre of gravity and inertia per labelled part and in total, from per-part materials or catalogue masses; optional robot payload check (e.g. `robot="UR10e"`) |
 | `query_features` | Cylinders (hole/boss, radius, axis, length) and planes of a part or region - read real dimensions off vendor CAD |
 | `section_view` | 2-D cross-section PNG on XY/XZ/YZ, parts coloured, areas listed |
 | `quick_look` | One progress sheet: coloured iso + front render and a section, for showing the user as you go |
@@ -55,6 +56,7 @@ forward briefly. Run `check_permissions` once at the start.
 | `shapr3d_keys` | macOS: send a shortcut (`cmd+z`, `escape`) or type text |
 | `export_from_shapr3d` | macOS: File > Export to > STEP/STL/... and fill the Save panel; focus returns to the previous app |
 | `check_permissions` | macOS: warm-up - request Accessibility / Screen Recording / Automation once, report status |
+| `wait_job` | Collect the result of a long tool call that returned `{status: "running", job_id}` |
 | `build123d_guide` | Modeling syntax cheat sheet for the AI |
 
 ## Setup
@@ -104,6 +106,31 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
    to `inspect_model` / `modify_model` it.
 
 Generated files live in `models/` (override with `SHAPR3D_MCP_WORKDIR`).
+
+### Long jobs, caches and limits
+
+Modeling, checks and renders run in one long-lived worker process, so the
+MCP connection stays responsive while OpenCascade is busy. A call that takes
+longer than `SHAPR3D_MCP_JOB_WAIT_S` (default 40 s, under the client's tool
+timeout) returns `{status: "running", job_id}`; `wait_job(job_id)` collects
+the result.
+
+- **Shape cache (memory):** the worker keeps the last 4 imported or built
+  models, so a `detect_clash` or `quick_look` right after a build skips
+  re-reading the STEP. A rebuilt file replaces its old version.
+- **Worker recycling:** malloc holds on to memory the CAD kernel has freed,
+  so once an idle worker passes `SHAPR3D_MCP_WORKER_MAX_RSS_MB` (default
+  3072) it is replaced by a fresh one. The memory cache goes with it.
+- **BREP cache (disk):** `load_cad` caches slow vendor STEP/IGES imports as
+  BREP in `models/.cache/`. It cleans itself: a file's new entry replaces its
+  older ones, entries unused for 30 days are dropped, and the folder is kept
+  under `SHAPR3D_MCP_CACHE_MAX_MB` (default 2048) by dropping the least
+  recently used. Deleting the folder is always safe.
+
+For big vendor parts (robot arms, grippers), derive a slim BREP once with a
+small script (`import_step`, keep the solids you need, `export_brep`) and
+`load_cad` that in the assembly script. A 240-solid gripper-beam assembly
+built that way takes about 12 s, and its `quick_look` about 5 s.
 
 ### Windows notes
 

@@ -55,7 +55,9 @@ mcp = FastMCP(
         "After each meaningful model change, call quick_look and show the "
         "PNG to the user - they only see images you send them. Modeling, "
         "checks and renders run in the CAD kernel and never need the "
-        "Shapr3D window."
+        "Shapr3D window. Long calls return {status: \"running\", job_id}: "
+        "call wait_job(job_id) until the result arrives. For robot "
+        "end effectors, mass_properties gives payload mass, CoG and inertia."
     ),
 )
 
@@ -85,6 +87,17 @@ WIN_PACKAGE_FAMILY_DEFAULT = "Shapr3D.Shapr3D_dvv5p1vgwv6mp"
 def _safe_name(name: str) -> str:
     name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip() or "model"
     return name
+
+
+def _out_base(name: str) -> Path:
+    """Output base path for a model name; "project/print/part" keeps its
+    subfolders (created as needed) but can never leave the workspace."""
+    parts = [p for p in re.split(r"[\\/]+", name) if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        raise ValueError(f"Invalid output name {name!r}: no '..' or empty names")
+    base = WORKDIR.joinpath(*[_safe_name(p) for p in parts])
+    base.parent.mkdir(parents=True, exist_ok=True)
+    return base
 
 
 def _resolve(path: str) -> Path:
@@ -253,7 +266,7 @@ def _script_env(ctx: dict, base_dir: Path) -> dict:
 
     def export_part(shape, name: str, formats: list[str] | None = None) -> list[str]:
         """Export an extra file (e.g. one print part) next to the result."""
-        files = _export(shape, WORKDIR / _safe_name(name), formats or ["step"])
+        files = _export(shape, _out_base(name), formats or ["step"])
         ctx["files"].extend(files)
         return files
 
@@ -983,7 +996,7 @@ def create_model(name: str, script: str, formats: list[str] | None = None,
     extra = {"params": _load_params(params_file)} if params_file else None
     ctx = {"warnings": [], "files": []}
     shape = _run_script(script, extra, ctx)
-    base = WORKDIR / _safe_name(name)
+    base = _out_base(name)
     files = _export(shape, base, formats or ["step"])
     return _build_report(shape, ctx["files"] + files, ctx["warnings"])
 
@@ -1028,7 +1041,7 @@ def run_model_file(script_path: str, name: str, formats: list[str] | None = None
     ctx = {"warnings": [], "files": []}
     shape = _run_script(src.read_text(), extra, ctx, filename=str(src),
                         base_dir=src.parent)
-    files = _export(shape, WORKDIR / _safe_name(name), formats or ["step"])
+    files = _export(shape, _out_base(name), formats or ["step"])
     return _build_report(shape, ctx["files"] + files, ctx["warnings"])
 
 
