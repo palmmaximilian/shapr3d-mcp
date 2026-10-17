@@ -175,16 +175,47 @@ def test_open_imports_into_open_project_by_default(fake_import, monkeypatch):
     assert 'keystroke "n"' not in fake_import[0] and "the current" in msg
 
 
+def _menu_after_cmd_n(scripts):
+    """Home-screen File menu until Cmd-N was sent, then a project's."""
+    def items(path):
+        if any('keystroke "n"' in sc for sc in scripts):
+            return ["New Project", "Import File…"]
+        return ["New Project", "Import as new project…"]
+    return items
+
+
 def test_open_creates_project_from_home_screen(fake_import, monkeypatch):
-    monkeypatch.setattr(macos, "menu_items", _menu(["New Project", "Import as new project…"]))
+    monkeypatch.setattr(macos, "menu_items", _menu_after_cmd_n(fake_import))
     msg = server.open_in_shapr3d("iterate_me.step")
     assert 'keystroke "n"' in fake_import[0] and "a new" in msg
+    # the import keystrokes go out only after the project is open
+    assert 'keystroke "i"' not in fake_import[0] and 'keystroke "i"' in fake_import[1]
 
 
 def test_open_new_project_only_when_asked(fake_import, monkeypatch):
     monkeypatch.setattr(macos, "menu_items", _menu(["Import File…"]))
     server.open_in_shapr3d("iterate_me.step", new_project=True)
     assert 'keystroke "n"' in fake_import[0]
+
+
+def test_new_project_that_never_opens_imports_nothing(fake_import, monkeypatch):
+    """Regression: a fixed 0.8 s delay after Cmd-N sent the Import shortcut
+    into nothing and the job then hung on History searches."""
+    monkeypatch.setattr(macos, "menu_items", _menu(["New Project", "Import as new project…"]))
+    clock = iter(range(0, 10_000, 5))
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(clock))
+    with pytest.raises(RuntimeError, match="did not open a new project"):
+        server.open_in_shapr3d("iterate_me.step")
+    assert not any('keystroke "i"' in sc for sc in fake_import)
+
+
+def test_import_confirmation_has_a_wall_clock_deadline(fake_import, monkeypatch):
+    monkeypatch.setattr(macos, "menu_items", _menu(["Import File…"]))
+    monkeypatch.setattr(server, "_shapr3d_history_mentions", lambda needle: False)
+    clock = iter(range(0, 10_000, 30))
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(clock))
+    with pytest.raises(RuntimeError, match="Could not confirm"):
+        server.open_in_shapr3d("iterate_me.step")
 
 
 def test_unreadable_menu_never_starts_new_project(fake_import, monkeypatch):

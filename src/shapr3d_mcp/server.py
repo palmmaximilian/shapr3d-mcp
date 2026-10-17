@@ -772,6 +772,9 @@ def _sidebar_rows() -> list[dict] | None:
     return rows if has_sidebar else None
 
 
+IMPORT_CONFIRM_S = 180.0   # big vendor STEPs take a minute or two to appear
+
+
 def _project_is_open() -> bool:
     """A project is open when the File menu offers "Import File…"; on the
     home screen it only has "Import as new project…". If the menu can't be
@@ -1858,21 +1861,34 @@ def open_in_shapr3d(path: str, new_project: bool | None = None,
     if new_project is None and sys.platform == "darwin":
         new_project = not _project_is_open()
 
+    def _new_project() -> None:
+        """Cmd-N, then wait until the new project's Items sidebar is really
+        there - a fixed delay lost the Import keystroke on slow starts."""
+        _osascript(f'''
+        tell application "{APP_NAME}" to activate
+        delay 0.4
+        tell application "System Events" to tell process "{APP_NAME}"
+            keystroke "n" using {{command down}}
+        end tell
+        ''')
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            if _project_is_open():
+                return
+        raise RuntimeError("Shapr3D did not open a new project within 15 s "
+                           "(Cmd-N) - nothing was imported.")
+
     def _attempt() -> None:
         subprocess.run(["open", "-a", APP_NAME], check=True, timeout=15)
         time.sleep(1.0)
 
         path_str = str(src).replace("\\", "\\\\").replace('"', '\\"')
-        new_project_step = (
-            'keystroke "n" using {command down}\n            delay 0.8'
-            if new_project else ""
-        )
         script = f'''
         tell application "{APP_NAME}" to activate
         delay 0.4
         tell application "System Events"
             tell process "{APP_NAME}"
-                {new_project_step}
                 keystroke "i" using {{shift down, command down}}
                 delay 0.8
                 keystroke "g" using {{shift down, command down}}
@@ -1902,8 +1918,10 @@ def open_in_shapr3d(path: str, new_project: bool | None = None,
     # Confirm via the Items sidebar (one more top-level item with this
     # model's name): fast at any project size. The History-panel search
     # walks the whole accessibility tree and takes >15 s on large projects.
+    if new_project and sys.platform == "darwin":
+        _new_project()
     before = None
-    if not new_project:
+    if sys.platform == "darwin":
         rows = _sidebar_rows()
         if rows is not None:
             before = sum(macos.name_matches(r, src.stem) for r in rows)
@@ -1923,7 +1941,8 @@ def open_in_shapr3d(path: str, new_project: bool | None = None,
         _attempt()
         # big STEP files (vendor CAD, 100+ bodies) take a minute to appear
         confirmed = False
-        for _ in range(130):
+        deadline = time.monotonic() + IMPORT_CONFIRM_S   # wall clock: History
+        while time.monotonic() < deadline:               # searches can take 15 s each
             if _arrived():
                 confirmed = True
                 break
@@ -1951,7 +1970,7 @@ def open_in_shapr3d(path: str, new_project: bool | None = None,
             time.sleep(0.4)
     raise RuntimeError(
         f"Could not confirm {src.name} was imported into Shapr3D within "
-        "90 s (no new item in the Items sidebar / History panel). It was not "
+        f"{IMPORT_CONFIRM_S:.0f} s (no new item in the Items sidebar / History panel). It was not "
         "retried, to avoid a duplicate. Call screenshot_shapr3d to see "
         "what actually happened - a dialog may be blocking input, or "
         "Accessibility/Automation permission may need re-granting in "
