@@ -232,7 +232,7 @@ def test_near_miss_measures_real_gap_inside_overlapping_boxes():
     )
     rep = server.detect_clash(["asm_ring.step"], near_miss_mm=0.5)
     assert rep["clear"] is True
-    assert rep["near_misses"] == [{"a": "Ring#0", "b": "Pin#0", "gap_mm": pytest.approx(0.3, abs=1e-3)}]
+    assert rep["near_misses"] == [{"a": "Ring#0", "b": "Pin#0", "gap_mm": pytest.approx(0.3, abs=0.025)}]  # mesh gap, 0.02 mm chords
 
 
 def test_clash_clear_when_only_expected():

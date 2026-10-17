@@ -11,7 +11,10 @@ Shapr3D has no public API, so this server pairs a real CAD kernel
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import functools
+import inspect
 import logging
 import os
 import re
@@ -20,6 +23,11 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
+from collections import OrderedDict
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -143,12 +151,46 @@ def _import_any(path: Path):
     )
 
 
-def _shape_stats(shape) -> dict:
+# path -> (cache_key, shape). Keyed by path so a rebuilt or re-exported
+# file replaces its stale version instead of keeping both alive (assembly
+# shapes run to ~0.5 GB each in the long-lived job worker).
+_SHAPE_CACHE: "OrderedDict[str, tuple[str, object]]" = OrderedDict()
+_SHAPE_CACHE_SIZE = 4
+
+
+def _cache_put(path: Path, shape) -> None:
+    slot = str(path.resolve())
+    _SHAPE_CACHE.pop(slot, None)
+    _SHAPE_CACHE[slot] = (kernel.cache_key(path), shape)
+    while len(_SHAPE_CACHE) > _SHAPE_CACHE_SIZE:
+        _SHAPE_CACHE.popitem(last=False)
+
+
+def _import_cached(path: Path):
+    """_import_any with an in-process cache keyed by path + mtime + size.
+    The server lives for the whole session, so the second look at a big
+    assembly (clash after build, section after quick_look) skips re-parsing
+    a STEP file that can take minutes. Labels and colours are kept."""
+    slot = str(path.resolve())
+    hit = _SHAPE_CACHE.get(slot)
+    if hit and hit[0] == kernel.cache_key(path):
+        _SHAPE_CACHE.move_to_end(slot)
+        return hit[1]
+    _SHAPE_CACHE.pop(slot, None)  # stale: free it before importing anew
+    shape = _import_any(path)
+    _cache_put(path, shape)
+    return shape
+
+
+def _shape_stats(shape, measures: "kernel.Measures | None" = None) -> dict:
     from build123d import Shape
 
+    if measures is None:
+        with kernel.Measures() as m:
+            return _shape_stats(shape, m)
     stats: dict = {}
     try:
-        bb = shape.bounding_box()
+        bb = measures.bbox(shape)
         stats["bounding_box_mm"] = {
             "size": [round(v, 3) for v in (bb.size.X, bb.size.Y, bb.size.Z)],
             "min": [round(v, 3) for v in (bb.min.X, bb.min.Y, bb.min.Z)],
@@ -156,12 +198,18 @@ def _shape_stats(shape) -> dict:
         }
     except Exception:
         pass
+    solids = []
     try:
-        stats["volume_mm3"] = round(shape.volume, 3)
+        solids = list(shape.solids()) if isinstance(shape, Shape) else []
     except Exception:
         pass
     try:
-        solids = shape.solids() if isinstance(shape, Shape) else []
+        # per solid, so repeated vendor parts are integrated once
+        vol = measures.total(solids) if solids else shape.volume
+        stats["volume_mm3"] = round(vol, 3)
+    except Exception:
+        pass
+    try:
         stats["solids"] = len(solids)
         stats["faces"] = len(shape.faces())
         stats["edges"] = len(shape.edges())
@@ -337,6 +385,9 @@ def _export(shape, base: Path, formats: list[str]) -> list[str]:
                 f"exportable geometry for the {fmt} format."
             )
         written.append(str(out))
+        if fmt == "step":
+            # the next check of this file (clash, section...) skips re-parsing
+            _cache_put(out, shape)
         if fmt == "gltf":
             # Non-binary glTF writes a .bin buffer sidecar the file refers to.
             sidecar = out.parent / (out.stem + ".bin")
@@ -371,7 +422,7 @@ def _collect_solids(paths: list[Path]) -> list[dict]:
     """Import files and flatten to a list of {ref, solid} entries."""
     entries: list[dict] = []
     for path in paths:
-        entries.extend(kernel.labelled_solids(_import_any(path), path.name))
+        entries.extend(kernel.labelled_solids(_import_cached(path), path.name))
     return entries
 
 
@@ -719,10 +770,114 @@ def _shapr3d_history_mentions(needle: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# long-running tools
+# ---------------------------------------------------------------------------
+# MCP clients cancel a tool call after a fixed timeout (~60 s in Claude), but
+# big vendor STEP files (robot arms, grippers) take minutes to load, clash-check
+# or export. Heavy tools therefore run in a worker PROCESS: OCCT's C++ calls
+# hold the GIL, so a worker thread would freeze the MCP event loop (no reply,
+# not even to wait_job). If a job finishes within JOB_WAIT_S its result is
+# returned as usual, otherwise the call returns a job handle and wait_job()
+# collects the result later. One long-lived worker: jobs run in call order and
+# its in-memory shape cache survives between calls.
+
+JOB_WAIT_S = float(os.environ.get("SHAPR3D_MCP_JOB_WAIT_S", "40"))
+_JOB_POOL: ProcessPoolExecutor | None = None
+_JOBS: dict[str, dict] = {}
+
+
+def _job_worker_init() -> None:
+    # fd 1 is the MCP stdio pipe, inherited by the worker: send anything the
+    # worker (or OCCT inside it) prints to stderr instead.
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+
+
+def _job_pool() -> ProcessPoolExecutor:
+    global _JOB_POOL
+    if _JOB_POOL is None:
+        _JOB_POOL = ProcessPoolExecutor(
+            max_workers=1, mp_context=multiprocessing.get_context("spawn"),
+            initializer=_job_worker_init)
+    return _JOB_POOL
+
+
+def _submit_job(fn, *args, **kwargs):
+    global _JOB_POOL
+    try:
+        return _job_pool().submit(fn, *args, **kwargs)
+    except BrokenProcessPool:
+        _JOB_POOL = None  # worker died (e.g. OCCT crash): start a fresh one
+        return _job_pool().submit(fn, *args, **kwargs)
+
+
+def _job_running(job_id: str) -> dict:
+    job = _JOBS[job_id]
+    return {
+        "status": "running",
+        "job_id": job_id,
+        "tool": job["tool"],
+        "elapsed_s": round(time.time() - job["started"]),
+        "next_step": f"Call wait_job(job_id={job_id!r}) until it returns the result.",
+    }
+
+
+async def _await_job(fut, wait_s: float):
+    # shield: a timed-out wait must not cancel a job that is still queued
+    return await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(fut)), wait_s)
+
+
+def _heavy_tool(fn):
+    """Register `fn` as an MCP tool that backgrounds itself past JOB_WAIT_S.
+    The module-level function stays synchronous (direct callers and tests)."""
+
+    @functools.wraps(fn)
+    async def runner(*args, **kwargs):
+        fut = _submit_job(fn, *args, **kwargs)
+        try:
+            return await _await_job(fut, JOB_WAIT_S)
+        except asyncio.TimeoutError:
+            job_id = f"{fn.__name__}-{uuid.uuid4().hex[:8]}"
+            _JOBS[job_id] = {"tool": fn.__name__, "future": fut, "started": time.time()}
+            return _job_running(job_id)
+
+    # The job handle is a dict whatever fn returns (str, Image...): drop the
+    # return annotation so FastMCP does not validate results against it.
+    runner.__annotations__ = {k: v for k, v in fn.__annotations__.items() if k != "return"}
+    runner.__signature__ = inspect.signature(fn).replace(
+        return_annotation=inspect.Signature.empty)
+    runner.__doc__ = (fn.__doc__ or "") + (
+        "\n\nLong runs return {status: \"running\", job_id} after "
+        f"~{JOB_WAIT_S:g} s; call wait_job(job_id) to get the result.\n"
+    )
+    mcp.tool()(runner)
+    return fn
+
+
+@mcp.tool()
+async def wait_job(job_id: str, timeout_s: float = JOB_WAIT_S):
+    """Wait for a tool call that returned {status: "running", job_id} and
+    return its result (or its error). Still running after timeout_s (capped
+    at the client-safe wait) -> returns the running status again; call again.
+    """
+    job = _JOBS.get(job_id)
+    if job is None:
+        raise ValueError(f"Unknown job_id {job_id!r}; known: {sorted(_JOBS)}")
+    try:
+        result = await _await_job(job["future"], max(1.0, min(timeout_s, JOB_WAIT_S)))
+    except asyncio.TimeoutError:
+        return _job_running(job_id)
+    finally:
+        if job["future"].done():
+            _JOBS.pop(job_id, None)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # modeling tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_heavy_tool
 def create_model(name: str, script: str, formats: list[str] | None = None,
                  params_file: str | None = None) -> dict:
     """Create a 3D model from a build123d Python script and export it.
@@ -757,8 +912,9 @@ def create_model(name: str, script: str, formats: list[str] | None = None,
 
 
 def _build_report(shape, files: list[str], warnings: list[str]) -> dict:
-    out = {"files": files, "stats": _shape_stats(shape)}
-    parts = kernel.part_inventory(shape)
+    with kernel.Measures() as measures:  # one mesh + one volume per solid
+        out = {"files": files, "stats": _shape_stats(shape, measures)}
+        parts = kernel.part_inventory(shape, measures)
     if parts:
         out["parts"] = parts
     if warnings:
@@ -767,7 +923,7 @@ def _build_report(shape, files: list[str], warnings: list[str]) -> dict:
     return out
 
 
-@mcp.tool()
+@_heavy_tool
 def run_model_file(script_path: str, name: str, formats: list[str] | None = None,
                    params_file: str | None = None) -> dict:
     """Build a model from a script FILE (version it like code) instead of an
@@ -799,7 +955,7 @@ def run_model_file(script_path: str, name: str, formats: list[str] | None = None
     return _build_report(shape, ctx["files"] + files, ctx["warnings"])
 
 
-@mcp.tool()
+@_heavy_tool
 def modify_model(input_path: str, script: str, output_name: str | None = None,
                  formats: list[str] | None = None,
                  params_file: str | None = None) -> dict:
@@ -824,7 +980,7 @@ def modify_model(input_path: str, script: str, output_name: str | None = None,
     src = _resolve(input_path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
-    imported = _import_any(src)
+    imported = _import_any(src)  # script may move it in place: no shared cache
     extra: dict = {"imported": imported}
     if params_file:
         extra["params"] = _load_params(params_file)
@@ -839,7 +995,7 @@ def modify_model(input_path: str, script: str, output_name: str | None = None,
     return out
 
 
-@mcp.tool()
+@_heavy_tool
 def inspect_model(path: str) -> dict:
     """Inspect a CAD file (STEP/IGES/STL/BREP/3MF): solids, bounding box,
     volume, face/edge counts. Use on files exported from Shapr3D to
@@ -848,7 +1004,7 @@ def inspect_model(path: str) -> dict:
     src = _resolve(path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
-    shape = _import_any(src)
+    shape = _import_cached(src)
     info: dict = {"file": str(src), "size_bytes": src.stat().st_size}
     info.update(_shape_stats(shape))
     try:
@@ -871,17 +1027,23 @@ def inspect_model(path: str) -> dict:
     return info
 
 
-@mcp.tool()
+@_heavy_tool
 def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001,
                  expected: list[str] | None = None,
-                 near_miss_mm: float = 0.0) -> dict:
-    """Check solids for interference (clash) by pairwise boolean intersection.
+                 near_miss_mm: float = 0.0, exact: bool = False) -> dict:
+    """Check solids for interference (clash).
 
     Pass one file (all solids in it are checked against each other — e.g. an
     assembly compound) or several files (solids are pooled across them).
     Assembly children with labels are reported by name ("Screws#2").
     Reference geometry like keep-out volumes can be modeled as solids and
     clash-checked against real parts to enforce interface contracts.
+
+    Fast by default: every solid is tessellated once (0.02 mm chord) and
+    pairs with touching bounding boxes are intersected as meshes
+    (manifold3d). Small mesh overlaps, where chordal error could fake a
+    sliver on touching curved faces, are confirmed with the exact B-rep
+    boolean; solids that do not mesh cleanly fall back to it as well.
 
     Args:
         paths: One or more STEP/IGES/STL/BREP/3MF files. Relative paths
@@ -894,12 +1056,16 @@ def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001,
             "A|B" (pair whose refs contain A and B) or "A" (any pair
             involving A); case-insensitive substrings.
         near_miss_mm: Also report non-overlapping pairs closer than this
-            (min distance), e.g. 1.0 to find tight clearances.
+            (min distance), e.g. 1.0 to find tight clearances. Mesh-based
+            gaps read up to ~0.02 mm small on curved faces.
+        exact: Use exact B-rep booleans for every pair (slow, minutes on
+            big vendor assemblies).
 
     Returns:
         clear: True if no unexpected pair overlaps; clashes / expected
         overlaps with volume and bounding box; near_misses with gap_mm.
     """
+    t0 = time.time()
     resolved = []
     for p in paths:
         src = _resolve(p)
@@ -912,8 +1078,17 @@ def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001,
             f"Need at least 2 solids to clash-check, found {len(entries)}. "
             "IGES files transfer as surfaces (no solids); convert to STEP."
         )
-    expected = expected or []
-    clashes, intended, near, check_errors = [], [], [], []
+    t_load = time.time() - t0
+    tm = {"load": round(t_load, 1)}
+    t = time.time()
+    for e in entries:
+        # fast (non-optimal) boxes: a slightly loose box only costs a few
+        # extra mesh checks, optimal ones cost seconds on vendor surfaces
+        e["bb"] = e["solid"].bounding_box(optimal=False)
+    tm["bbox"] = round(time.time() - t, 1)
+    # candidate pairs: boxes within near_miss_mm of each other
+    reach = max(near_miss_mm, 0.0)
+    cands = []
     pairs = 0
     for i in range(len(entries)):
         for j in range(i + 1, len(entries)):
@@ -923,51 +1098,80 @@ def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001,
                 # are not clash-checked against each other
                 continue
             pairs += 1
-            gap_bb = kernel.bbox_gap(a["solid"], b["solid"])
-            if gap_bb > 0:
-                # Cheap reject: bounding boxes that don't intersect can't clash.
-                if near_miss_mm and gap_bb < near_miss_mm:
-                    gap = a["solid"].distance_to(b["solid"])
-                    if gap < near_miss_mm:
-                        near.append({"a": a["ref"], "b": b["ref"], "gap_mm": round(gap, 3)})
+            gap_bb = kernel.box_gap(a["bb"], b["bb"])
+            if gap_bb > reach or (gap_bb > 0 and not near_miss_mm):
                 continue
-            # A failed boolean must NOT read as "no clash" - record it so the
-            # caller knows the check was incomplete.
-            try:
-                overlap = a["solid"].intersect(b["solid"])
-                vol = kernel._vol(overlap)
-            except Exception as exc:
-                check_errors.append(
-                    {"a": a["ref"], "b": b["ref"], "error": str(exc)[:200]}
-                )
-                continue
-            if vol > min_overlap_mm3:
-                entry = {
-                    "a": a["ref"],
-                    "b": b["ref"],
-                    "overlap_mm3": round(vol, 4),
-                }
+            cands.append((a, b, gap_bb))
+    t = time.time()
+    if not exact:
+        for a, b, _ in cands:
+            for e in (a, b):
+                if "man" not in e:
+                    e["man"] = kernel.solid_manifold(e["solid"])
+    tm["mesh"] = round(time.time() - t, 1)
+    t_exact = t_near = 0.0
+    confirm_below = max(1.0, 1000 * min_overlap_mm3)
+
+    def exact_overlap(a, b):
+        overlap = a["solid"].intersect(b["solid"])
+        return overlap, kernel._vol(overlap)
+
+    expected = expected or []
+    clashes, intended, near, check_errors = [], [], [], []
+    n_exact = 0
+    for a, b, gap_bb in cands:
+        overlap = None
+        vol = None
+        if gap_bb == 0:
+            if not exact:
+                vol = kernel.mesh_overlap(a["man"], b["man"])
+            if vol is None or 0 < vol < confirm_below:
+                # A failed boolean must NOT read as "no clash" - record it so
+                # the caller knows the check was incomplete.
                 try:
+                    n_exact += 1
+                    t = time.time()
+                    overlap, vol = exact_overlap(a, b)
+                    t_exact += time.time() - t
+                except Exception as exc:
+                    check_errors.append(
+                        {"a": a["ref"], "b": b["ref"], "error": str(exc)[:200]}
+                    )
+                    continue
+        if vol is not None and vol > min_overlap_mm3:
+            entry = {"a": a["ref"], "b": b["ref"], "overlap_mm3": round(vol, 4)}
+            try:
+                if overlap is None:
+                    bb = (a["man"] ^ b["man"]).bounding_box()
+                    lo, hi = bb[:3], bb[3:]
+                else:
                     items = overlap if isinstance(overlap, list) else [overlap]
                     from build123d import Compound
                     obb = Compound(children=[x for x in items]).bounding_box()
-                    entry["overlap_bbox_min"] = [
-                        round(v, 3) for v in (obb.min.X, obb.min.Y, obb.min.Z)
-                    ]
-                    entry["overlap_bbox_max"] = [
-                        round(v, 3) for v in (obb.max.X, obb.max.Y, obb.max.Z)
-                    ]
-                except Exception:
-                    pass  # location is best-effort; the clash itself stands
-                if any(kernel.pair_matches(pt, a["ref"], b["ref"]) for pt in expected):
-                    intended.append(entry)
-                else:
-                    clashes.append(entry)
-            elif near_miss_mm:
-                # boxes overlap but the solids may still be apart
+                    lo = (obb.min.X, obb.min.Y, obb.min.Z)
+                    hi = (obb.max.X, obb.max.Y, obb.max.Z)
+                entry["overlap_bbox_min"] = [round(v, 3) for v in lo]
+                entry["overlap_bbox_max"] = [round(v, 3) for v in hi]
+            except Exception:
+                pass  # location is best-effort; the clash itself stands
+            if any(kernel.pair_matches(pt, a["ref"], b["ref"]) for pt in expected):
+                intended.append(entry)
+            else:
+                clashes.append(entry)
+        elif near_miss_mm:
+            # mesh distance: chords sit inside convex curves, so a gap reads at
+            # most ~0.02 mm small (conservative). Exact B-rep distance only
+            # with exact=True or for solids that would not mesh - it costs
+            # up to seconds per pair on vendor parts.
+            meshed = not exact and a.get("man") is not None and b.get("man") is not None
+            t = time.time()
+            if meshed:
+                gap = kernel.mesh_gap(a["man"], b["man"], near_miss_mm)
+            else:
                 gap = a["solid"].distance_to(b["solid"])
-                if gap < near_miss_mm:
-                    near.append({"a": a["ref"], "b": b["ref"], "gap_mm": round(gap, 3)})
+            t_near += time.time() - t
+            if gap is not None and gap < near_miss_mm:
+                near.append({"a": a["ref"], "b": b["ref"], "gap_mm": round(gap, 3)})
     out = {
         "clear": not clashes and not check_errors,
         "solids": len(entries),
@@ -979,10 +1183,14 @@ def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001,
         out["expected_overlaps"] = intended
     if near_miss_mm:
         out["near_misses"] = sorted(near, key=lambda n: n["gap_mm"])
+    out["timing_s"] = {**tm, "exact": round(t_exact, 1), "near_miss": round(t_near, 1),
+                       "total": round(time.time() - t0, 1),
+                       "exact_booleans": n_exact,
+                       "mesh_fallbacks": sum(1 for e in entries if e.get("man", 0) is None)}
     return out
 
 
-@mcp.tool()
+@_heavy_tool
 def query_features(path: str, part: str | None = None,
                    kinds: list[str] | None = None,
                    region_min: list[float] | None = None,
@@ -1007,7 +1215,7 @@ def query_features(path: str, part: str | None = None,
     bad = kinds_set - {"cylinder", "plane"}
     if bad:
         raise ValueError(f"Unknown kinds {sorted(bad)}; use cylinder / plane")
-    entries = kernel.labelled_solids(_import_any(src), src.name)
+    entries = kernel.labelled_solids(_import_cached(src), src.name)
     if part:
         entries = [e for e in entries if kernel.norm(part) in kernel.norm(e["ref"])]
         if not entries:
@@ -1082,7 +1290,7 @@ def _select(entries: list[dict], include: list[str] | None, exclude: list[str] |
     return entries
 
 
-@mcp.tool()
+@_heavy_tool
 def section_view(path: str, plane: str = "XZ", offset: float = 0.0,
                  width: int = 900, height: int = 900,
                  zoom_min: list[float] | None = None,
@@ -1100,15 +1308,15 @@ def section_view(path: str, plane: str = "XZ", offset: float = 0.0,
     src = _resolve(path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
-    shape = _import_any(src)
+    shape = _import_cached(src)
     tag = "_zoom" if zoom_min and zoom_max else ""
     out = WORKDIR / f"{_safe_name(src.stem)}_section_{plane.upper()}_{offset:g}{tag}.png"
-    _section_png(kernel.labelled_solids(shape, src.name), shape.bounding_box(), plane,
+    _section_png(kernel.labelled_solids(shape, src.name), kernel.fast_bbox(shape), plane,
                  offset, out, width, height, zoom_min, zoom_max)
     return Image(path=str(out))
 
 
-@mcp.tool()
+@_heavy_tool
 def quick_look(path: str, include: list[str] | None = None,
                exclude: list[str] | None = None, plane: str = "XZ",
                offset: float = 0.0) -> dict:
@@ -1132,7 +1340,7 @@ def quick_look(path: str, include: list[str] | None = None,
     src = _resolve(path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
-    shape = _import_any(src)
+    shape = _import_cached(src)
     entries = _select(kernel.labelled_solids(shape, src.name), include, exclude)
     sub = Compound(children=[e["solid"] for e in entries])
     stem = _safe_name(src.stem)
@@ -1145,7 +1353,7 @@ def quick_look(path: str, include: list[str] | None = None,
                    palette(i % 10)[:3]) for i, n in enumerate(names)]
         _render_png(sub, views, [("iso", 25, -60, False), ("front", 0, -90, True)],
                     1000, 900, False, parts=groups)
-        _section_png(entries, sub.bounding_box(), plane, offset, sec, 800, 900)
+        _section_png(entries, kernel.fast_bbox(sub), plane, offset, sec, 800, 900)
         fig, axs = plt.subplots(1, 2, figsize=(18, 9), dpi=100,
                                 gridspec_kw={"width_ratios": [1.1, 1]})
         for ax, img in zip(axs, (views, sec)):
@@ -1160,7 +1368,7 @@ def quick_look(path: str, include: list[str] | None = None,
             "next_step": "Send this PNG to the user so they can see progress."}
 
 
-@mcp.tool()
+@_heavy_tool
 def diff_models(before: str, after: str, part: str | None = None,
                 min_volume_mm3: float = 0.01) -> dict:
     """Compare two versions of a model - e.g. the STEP you sent to Shapr3D
@@ -1181,7 +1389,7 @@ def diff_models(before: str, after: str, part: str | None = None,
         srcs.append(src)
     shapes = []
     for src in srcs:
-        entries = kernel.labelled_solids(_import_any(src), src.name)
+        entries = kernel.labelled_solids(_import_cached(src), src.name)
         if part:
             entries = [e for e in entries if kernel.norm(part) in kernel.norm(e["ref"])]
             if not entries:
@@ -1194,7 +1402,7 @@ def diff_models(before: str, after: str, part: str | None = None,
     return report
 
 
-@mcp.tool()
+@_heavy_tool
 def convert_model(path: str, formats: list[str], output_name: str | None = None) -> dict:
     """Convert a CAD file to other formats. Reads STEP/IGES/STL/BREP/3MF and
     writes step, stl, 3mf, gltf, glb, brep (glTF is export-only). E.g.
@@ -1204,7 +1412,7 @@ def convert_model(path: str, formats: list[str], output_name: str | None = None)
     src = _resolve(path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
-    shape = _import_any(src)
+    shape = _import_cached(src)
     # Defaults to the source stem, but never over the source file itself.
     # Shape is imported first so a bad file fails before anything is written.
     base = _output_base(src, output_name, src.stem, formats, keep_existing=True)
@@ -1223,7 +1431,7 @@ VIEW_PRESETS = {
 }
 
 
-@mcp.tool()
+@_heavy_tool
 def render_preview(path: str, width: int = 800, height: int = 600,
                    views: list[str] | None = None,
                    elevation: float | None = None,
@@ -1245,7 +1453,7 @@ def render_preview(path: str, width: int = 800, height: int = 600,
     src = _resolve(path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
-    shape = _import_any(src)
+    shape = _import_cached(src)
     if elevation is not None or azimuth is not None:
         cams = [("custom", elevation if elevation is not None else 30,
                  azimuth if azimuth is not None else -60, False)]
@@ -1266,6 +1474,7 @@ def render_preview(path: str, width: int = 800, height: int = 600,
 
 
 DEFAULT_RGB = (0.35, 0.55, 0.85)
+RENDER_MAX_TRIS = 250_000  # per render (all views share the mesh)
 
 
 def _render_png(shape, out: Path, cams: list[tuple], width: int, height: int,
@@ -1274,22 +1483,37 @@ def _render_png(shape, out: Path, cams: list[tuple], width: int, height: int,
     optional [(shape, rgb)] list to colour assembly parts separately."""
     import numpy as np
     from build123d import export_stl
+    from OCP.BRepTools import BRepTools
 
     parts = parts or [(shape, DEFAULT_RGB)]
     # tessellate to roughly pixel size: the default 0.001 mm tolerance
     # turns vendor CAD into millions of triangles matplotlib crawls on
-    diag = shape.bounding_box().diagonal
-    tri_list, nrm_list, rgb_list = [], [], []
-    with tempfile.TemporaryDirectory() as td:
-        for k, (part, rgb) in enumerate(parts):
-            stl_path = Path(td) / f"p{k}.stl"
-            export_stl(part, str(stl_path), tolerance=max(diag / 3000, 0.002),
-                       angular_tolerance=0.25)
-            t, n = _read_binary_stl(stl_path)
-            tri_list.append(t)
-            nrm_list.append(n)
-            rgb_list.append(np.tile(np.array(rgb, dtype=float), (len(t), 1)))
+    # (the loose box is plenty for picking a tolerance)
+    diag = shape.bounding_box(optimal=False).diagonal
+    tol, ang = max(diag / 1500, 0.002), 0.5
+    for attempt in range(4):
+        tri_list, nrm_list, rgb_list = [], [], []
+        with tempfile.TemporaryDirectory() as td:
+            for k, (part, rgb) in enumerate(parts):
+                stl_path = Path(td) / f"p{k}.stl"
+                export_stl(part, str(stl_path), tolerance=tol, angular_tolerance=ang)
+                t, n = _read_binary_stl(stl_path)
+                tri_list.append(t)
+                nrm_list.append(n)
+                rgb_list.append(np.tile(np.array(rgb, dtype=float), (len(t), 1)))
+        count = sum(len(t) for t in tri_list)
+        if count <= RENDER_MAX_TRIS or attempt == 3:
+            break
+        # matplotlib holds ~2-3 kB per triangle and view: two gripper-beam
+        # views at 2 M triangles ran past 6 GB. Re-mesh coarser (the mesher
+        # keeps a finer existing mesh, so drop it first).
+        del tri_list, nrm_list, rgb_list
+        for part, _ in parts:
+            BRepTools.Clean_s(part.wrapped)
+        tol *= count / RENDER_MAX_TRIS
+        ang = min(ang * 2, 0.8)
     tris, normals, base_rgb = (np.concatenate(x) for x in (tri_list, nrm_list, rgb_list))
+    del tri_list, nrm_list, rgb_list
 
     import matplotlib
     matplotlib.use("Agg")
@@ -1324,12 +1548,15 @@ def _render_png(shape, out: Path, cams: list[tuple], width: int, height: int,
         cam = np.array([np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e)])
         light = cam + 0.35 * np.array([-np.sin(a), np.cos(a), 0.6])
         light = light / np.linalg.norm(light)
-        shade = 0.3 + 0.7 * np.clip(normals @ light, 0, 1)
-        colors = base_rgb * shade[:, None]
+        # back faces of closed solids are hidden anyway: skip them (halves
+        # matplotlib's memory and time; margin for perspective views)
+        front = normals @ cam > -0.2
+        shade = 0.3 + 0.7 * np.clip(normals[front] @ light, 0, 1)
+        colors = base_rgb[front] * shade[:, None]
         # Stroke each triangle in its own colour: with edgecolor="none" the
         # antialiased gaps between triangles show up as light seams.
         coll = Poly3DCollection(
-            tris, facecolors=colors, edgecolors=colors, linewidths=0.4
+            tris[front], facecolors=colors, edgecolors=colors, linewidths=0.4
         )
         ax.add_collection3d(coll)
         if edge_lines:
@@ -1398,7 +1625,7 @@ IMPORT_DIALOG_NOTE = (
 )
 
 
-@mcp.tool()
+@_heavy_tool
 def open_in_shapr3d(path: str, new_project: bool | None = None,
                     replace: bool = True) -> str:
     """Open a CAD file in Shapr3D as a real editable body.

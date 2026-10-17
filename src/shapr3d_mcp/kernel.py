@@ -115,8 +115,138 @@ def load_cad(path: Path, importer, cache_dir: Path, use_cache: bool = True):
 # inventory
 # ---------------------------------------------------------------------------
 
-def _bbox(shape) -> dict:
-    bb = shape.bounding_box()
+EXACT_BBOX_MAX_FACES = 2000  # above this, bounding boxes come from a mesh
+BBOX_DEFLECTION = 0.05       # mm; mesh boxes can be up to this much small
+
+
+class Measures:
+    """Bounding boxes and volumes for reports on big vendor assemblies.
+
+    build123d's bounding_box() is exact (BRepBndLib.AddOptimal on the
+    surfaces): ~7 s per RG2 gripper, ~25 s for a gripper-beam assembly,
+    per call. Shapes up to EXACT_BBOX_MAX_FACES keep that exact box. For
+    bigger ones each distinct solid is meshed once at BBOX_DEFLECTION, its
+    mesh nodes are kept (in the solid's own frame) and the mesh is dropped
+    right away; every placed copy is boxed by moving those nodes. So the
+    peak is one solid's mesh, not the assembly's (~1 GB for the RG2 beam),
+    and no mesh is left behind - OCCT keeps a finer existing mesh, so a
+    later coarse export_stl (quick_look) would inherit millions of triangles.
+
+    Volumes are also computed once per distinct solid: Location copies share
+    their TShape (two RG2 grippers = one set of 95 volumes), and a rigid
+    move does not change a volume.
+    """
+
+    def __init__(self):
+        self._seen: dict[int, list[tuple]] = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self) -> None:
+        self._seen.clear()
+
+    def _entry(self, solid) -> dict:
+        """Per-TShape cache slot of `solid` (same solid, any placement)."""
+        from OCP.TopLoc import TopLoc_Location
+
+        bare = solid.wrapped.Located(TopLoc_Location())
+        bucket = self._seen.setdefault(hash(bare), [])
+        for other, entry in bucket:
+            if other.IsPartner(bare) and other.Orientation() == bare.Orientation():
+                return entry
+        entry = {"bare": bare}
+        bucket.append((bare, entry))
+        return entry
+
+    def bbox(self, shape):
+        import numpy as np
+        from build123d import BoundBox
+        from OCP.Bnd import Bnd_Box
+
+        if len(shape.faces()) <= EXACT_BBOX_MAX_FACES:
+            return shape.bounding_box()
+        solids = list(shape.solids())
+        if sum(len(s.faces()) for s in solids) < len(shape.faces()):
+            return shape.bounding_box()  # loose faces/shells: no shortcut
+        lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
+        for s in solids:
+            entry = self._entry(s)
+            if "nodes" not in entry:
+                entry["nodes"] = _mesh_nodes(entry["bare"])
+            trsf = s.wrapped.Location().Transformation()
+            rot = np.array([[trsf.Value(r, c) for c in (1, 2, 3)] for r in (1, 2, 3)])
+            off = np.array([trsf.Value(r, 4) for r in (1, 2, 3)])
+            pts = entry["nodes"] @ rot.T + off
+            lo, hi = np.minimum(lo, pts.min(axis=0)), np.maximum(hi, pts.max(axis=0))
+        if not np.isfinite(lo).all():
+            return shape.bounding_box()
+        box = Bnd_Box()
+        box.Update(*lo, *hi)
+        return BoundBox(box)
+
+    def volume(self, solid) -> float:
+        entry = self._entry(solid)
+        if "volume" not in entry:
+            entry["volume"] = solid.volume
+        return entry["volume"]
+
+    def total(self, solids) -> float:
+        return sum(self.volume(s) for s in solids)
+
+
+def _mesh_nodes(bare):
+    """Mesh nodes of a solid in its own frame (numpy N x 3); the mesh is
+    removed again. Faces the mesher skips add their exact box corners."""
+    import numpy as np
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.BRepTools import BRepTools
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
+
+    BRepMesh_IncrementalMesh(bare, BBOX_DEFLECTION, False, 0.5, True)
+    chunks = []
+    exp = TopExp_Explorer(bare, TopAbs_FACE)
+    while exp.More():
+        face = TopoDS.Face_s(exp.Current())
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation_s(face, loc)
+        if tri is not None and tri.NbNodes():
+            trsf = loc.Transformation()
+            ident = loc.IsIdentity()
+            pts = []
+            for i in range(1, tri.NbNodes() + 1):
+                p = tri.Node(i) if ident else tri.Node(i).Transformed(trsf)
+                pts.append((p.X(), p.Y(), p.Z()))
+            chunks.append(np.array(pts))
+        else:
+            box = Bnd_Box()
+            BRepBndLib.AddOptimal_s(face, box, False, False)
+            if not box.IsVoid():
+                x0, y0, z0, x1, y1, z1 = box.Get()
+                chunks.append(np.array([(x, y, z) for x in (x0, x1)
+                                        for y in (y0, y1) for z in (z0, z1)]))
+        exp.Next()
+    BRepTools.Clean_s(bare)
+    return np.concatenate(chunks) if chunks else np.zeros((0, 3))
+
+
+def fast_bbox(shape):
+    """BoundBox of `shape`, fast also for big assemblies (see Measures)."""
+    with Measures() as m:
+        return m.bbox(shape)
+
+
+def _bbox(shape, measures: Measures | None = None) -> dict:
+    bb = measures.bbox(shape) if measures else fast_bbox(shape)
     return {"min": [round(v, 2) for v in (bb.min.X, bb.min.Y, bb.min.Z)],
             "max": [round(v, 2) for v in (bb.max.X, bb.max.Y, bb.max.Z)]}
 
@@ -153,21 +283,24 @@ def child_names(shape, file_tag: str) -> list[str] | None:
     return names
 
 
-def part_inventory(shape) -> list[dict]:
+def part_inventory(shape, measures: Measures | None = None) -> list[dict]:
     """Top-level assembly children with solid counts, volume and bbox.
     Empty when the shape is not an assembly with labelled children."""
     shape = unwrap_groups(shape)
     names = child_names(shape, "part")
     if not names:
         return []
+    if measures is None:
+        with Measures() as m:
+            return part_inventory(shape, m)
     parts = []
     for name, c in zip(names, shape.children):
         solids = list(c.solids())
         parts.append({
             "part": name,
             "solids": len(solids),
-            "volume_mm3": round(sum(s.volume for s in solids), 1),
-            **_bbox(c),
+            "volume_mm3": round(measures.total(solids), 1),
+            **_bbox(c, measures),
         })
     return parts
 
@@ -190,8 +323,12 @@ def labelled_solids(shape, file_tag: str) -> list[dict]:
 
 
 def bbox_gap(a, b) -> float:
-    """Distance between two axis-aligned bounding boxes (0 if overlapping)."""
-    A, B = a.bounding_box(), b.bounding_box()
+    """Distance between two shapes' axis-aligned bounding boxes (0 if overlapping)."""
+    return box_gap(a.bounding_box(), b.bounding_box())
+
+
+def box_gap(A, B) -> float:
+    """Distance between two precomputed BoundBox objects (0 if overlapping)."""
     d = [max(0.0, B.min.X - A.max.X, A.min.X - B.max.X),
          max(0.0, B.min.Y - A.max.Y, A.min.Y - B.max.Y),
          max(0.0, B.min.Z - A.max.Z, A.min.Z - B.max.Z)]
@@ -344,6 +481,8 @@ def face_rings(face, plane, samples: int = 160) -> list[list[tuple[float, float]
             # position_at already follows the edge's orientation in the wire
             pts += [plane.to_local_coords(e.position_at(i / n)) for i in range(n)]
             explorer.Next()
+        if len(pts) < 3:
+            continue  # degenerate wire (UR wrist sections have edgeless ones)
         ring = [(p.X, p.Y) for p in pts]
         area = 0.5 * sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(ring, ring[1:] + ring[:1]))
         if (k == 0 and area < 0) or (k > 0 and area > 0):
@@ -531,3 +670,94 @@ def diff_solids(a, b, min_volume: float = 0.01, max_faces: int = 30) -> dict:
     if artifacts:
         out["cancelled_artifacts"] = artifacts
     return out
+
+
+# ---------------------------------------------------------------------------
+# fast mesh clash (manifold3d)
+# ---------------------------------------------------------------------------
+# Exact B-rep booleans cost up to seconds per pair on vendor parts. Each solid
+# is instead tessellated once (cached on the solid), welded into a closed
+# manifold and intersected with manifold3d - typically microseconds to
+# milliseconds per pair. Callers confirm small overlaps with the exact kernel,
+# since chordal error can fake a sliver where curved faces touch.
+
+def solid_manifold(solid, tol: float = 0.02):
+    """Closed manifold3d mesh of a solid, or None if it cannot be made
+    manifold (open shell, bad triangulation). Cached on the solid."""
+    cached = getattr(solid, "_clash_manifold", False)
+    if cached is not False:
+        return cached
+    import numpy as np
+    import manifold3d as m3d
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
+
+    result = None
+    try:
+        BRepMesh_IncrementalMesh(solid.wrapped, tol, False, 0.3, True)
+        verts, tris, off = [], [], 0
+        exp = TopExp_Explorer(solid.wrapped, TopAbs_FACE)
+        while exp.More():
+            face = TopoDS.Face_s(exp.Current())
+            loc = TopLoc_Location()
+            tri = BRep_Tool.Triangulation_s(face, loc)
+            exp.Next()
+            if tri is None:
+                continue
+            trsf = loc.Transformation()
+            n = tri.NbNodes()
+            pts = np.empty((n, 3))
+            for i in range(1, n + 1):
+                p = tri.Node(i).Transformed(trsf)
+                pts[i - 1] = (p.X(), p.Y(), p.Z())
+            t = np.empty((tri.NbTriangles(), 3), dtype=np.int64)
+            for i in range(1, tri.NbTriangles() + 1):
+                t[i - 1] = tri.Triangle(i).Get()
+            t -= 1
+            if face.Orientation() == TopAbs_REVERSED:
+                t = t[:, ::-1]
+            verts.append(pts)
+            tris.append(t + off)
+            off += n
+        if verts:
+            v = np.concatenate(verts)
+            f = np.concatenate(tris)
+            # faces share edge discretisations: weld identical nodes
+            _, first, inverse = np.unique(np.round(v, 5), axis=0,
+                                          return_index=True, return_inverse=True)
+            f = inverse.reshape(-1)[f]
+            f = f[(f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])]
+            mesh = m3d.Mesh(vert_properties=v[first].astype(np.float32),
+                            tri_verts=f.astype(np.uint32))
+            man = m3d.Manifold(mesh)
+            if man.status() != m3d.Error.NoError:
+                mesh.merge()
+                man = m3d.Manifold(mesh)
+            if man.status() == m3d.Error.NoError and not man.is_empty():
+                result = man
+    except Exception:
+        result = None
+    try:
+        solid._clash_manifold = result
+    except Exception:
+        pass
+    return result
+
+
+def mesh_overlap(a, b) -> float | None:
+    """Overlap volume of two manifolds (mm^3); None if either is missing."""
+    if a is None or b is None:
+        return None
+    return (a ^ b).volume()
+
+
+def mesh_gap(a, b, search: float) -> float | None:
+    """Min distance between two manifolds if below `search`, else None."""
+    if a is None or b is None:
+        return None
+    g = a.min_gap(b, search)
+    return g if g < search else None
