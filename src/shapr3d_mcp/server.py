@@ -646,6 +646,11 @@ IMPORTS_MANIFEST = WORKDIR / ".shapr3d_imports.json"
 
 
 def _body_count(src: Path) -> int:
+    # a freshly built model is already in memory (pre-warmed on export):
+    # use it rather than writing a BREP cache entry for every rebuild
+    hit = _SHAPE_CACHE.get(str(src.resolve()))
+    if hit and hit[0] == kernel.cache_key(src):
+        return len(hit[1].solids())
     return len(kernel.load_cad(src, _import_any, CACHE_DIR).solids())
 
 
@@ -2032,6 +2037,7 @@ def export_from_shapr3d(name: str, fmt: str = "step", folder: str | None = None,
     ext = EXPORT_EXT.get(fmt, fmt)
     before = {p for p in dest.iterdir()} if dest.exists() else set()
     previous = macos.frontmost_app()
+    macos.activate()  # Shapr3D ignores menu actions while in the background
     macos.menu(["File", "Export to", EXPORT_MENU[fmt]])
     if not macos.wait_for_save_dialog(timeout_s):
         _, items = macos.read_ui(WORKDIR / "_shapr3d_ui.png")
@@ -2223,6 +2229,10 @@ def _preload_native_modules() -> None:
 def main() -> None:
     if IS_WINDOWS:
         _preload_native_modules()
+    try:
+        kernel.prune_cache(CACHE_DIR)  # age/size limits, also without new writes
+    except OSError:
+        pass
     mcp.run()
 
 

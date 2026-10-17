@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
+import re
+import time
 from pathlib import Path
 
 
@@ -95,9 +98,18 @@ def cache_key(path: Path) -> str:
     return hashlib.sha1(raw).hexdigest()[:16]
 
 
+CACHE_MAX_BYTES = int(os.environ.get("SHAPR3D_MCP_CACHE_MAX_MB", "2048")) * 2**20
+CACHE_MAX_AGE_S = 30 * 24 * 3600   # entries unused this long are dropped
+
+
 def load_cad(path: Path, importer, cache_dir: Path, use_cache: bool = True):
     """Import a CAD file; STEP/IGES results are cached as BREP keyed by
-    path + mtime + size (labels/colours are not kept in the cache)."""
+    path + mtime + size (labels/colours are not kept in the cache).
+
+    The cache cleans itself: writing a new version of a file's BREP drops
+    the older ones of that file (every rebuild of an assembly STEP is a new
+    key, ~30 MB each), and prune_cache keeps the folder under
+    CACHE_MAX_BYTES and drops entries unused for CACHE_MAX_AGE_S."""
     from build123d import export_brep, import_brep
 
     if not use_cache or path.suffix.lower() not in {".step", ".stp", ".iges", ".igs"}:
@@ -105,10 +117,56 @@ def load_cad(path: Path, importer, cache_dir: Path, use_cache: bool = True):
     cache_dir.mkdir(parents=True, exist_ok=True)
     cached = cache_dir / f"{path.stem}-{cache_key(path)}.brep"
     if cached.exists():
+        try:
+            os.utime(cached)  # mtime = last use, for prune_cache
+        except OSError:
+            pass
         return import_brep(str(cached))
     shape = importer(path)
-    export_brep(shape, str(cached))
+    tmp = cached.with_suffix(".brep.tmp")
+    export_brep(shape, str(tmp))
+    os.replace(tmp, cached)  # no half-written entry if the worker dies
+    stale = re.compile(re.escape(path.stem) + r"-[0-9a-f]{16}\.brep")
+    for old in cache_dir.iterdir():
+        if old != cached and stale.fullmatch(old.name):
+            old.unlink(missing_ok=True)
+    prune_cache(cache_dir, keep=cached)
     return shape
+
+
+def prune_cache(cache_dir: Path, keep: Path | None = None,
+                max_bytes: int | None = None, max_age_s: float | None = None) -> list[Path]:
+    """Delete cache entries unused for max_age_s, then the least recently
+    used ones until the folder is under max_bytes. Returns what was removed."""
+    max_bytes = CACHE_MAX_BYTES if max_bytes is None else max_bytes
+    max_age_s = CACHE_MAX_AGE_S if max_age_s is None else max_age_s
+    if not cache_dir.is_dir():
+        return []
+    now = time.time()
+    entries = []
+    for f in cache_dir.iterdir():
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        if f.is_file():
+            entries.append((st.st_mtime, st.st_size, f))
+    removed = []
+    entries.sort()  # oldest use first
+    total = sum(size for _, size, _ in entries)
+    for mtime, size, f in entries:
+        if f == keep:
+            continue
+        # leftovers of an interrupted write count as stale after an hour
+        tmp_left = f.name.endswith(".tmp") and now - mtime > 3600
+        if tmp_left or now - mtime > max_age_s or total > max_bytes:
+            try:
+                f.unlink()
+            except OSError:
+                continue
+            total -= size
+            removed.append(f)
+    return removed
 
 
 # ---------------------------------------------------------------------------

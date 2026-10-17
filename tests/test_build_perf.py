@@ -58,3 +58,43 @@ def test_shape_cache_replaces_stale_version(tmp_path, monkeypatch):
     shape = server._import_cached(f)
     assert len(server._SHAPE_CACHE) == 1
     assert abs(shape.volume - 8) < 1e-6
+
+
+def _fake_step(path, size=1):
+    from build123d import export_step
+    export_step(Box(size, size, size), str(path))
+
+
+def test_load_cad_drops_stale_versions(tmp_path):
+    import os
+    from build123d import import_step
+
+    cache = tmp_path / ".cache"
+    src = tmp_path / "asm.step"
+    other = tmp_path / "asm-b.step"      # stem shares the prefix: must survive
+    _fake_step(other)
+    kernel.load_cad(other, lambda p: import_step(str(p)), cache)
+    for i in range(3):
+        _fake_step(src, i + 1)
+        os.utime(src, ns=(i + 1, i + 1))
+        kernel.load_cad(src, lambda p: import_step(str(p)), cache)
+    names = sorted(f.name for f in cache.iterdir())
+    assert len(names) == 2
+    assert any(n.startswith("asm-b-") for n in names)
+    assert f"asm-{kernel.cache_key(src)}.brep" in names
+
+
+def test_prune_cache_age_and_size(tmp_path):
+    import os
+    import time
+
+    cache = tmp_path / ".cache"
+    cache.mkdir()
+    now = time.time()
+    for i, age_days in enumerate((40, 3, 2, 1)):
+        f = cache / f"p{i}-{i:016x}.brep"
+        f.write_bytes(b"x" * 1000)
+        os.utime(f, (now - age_days * 86400,) * 2)
+    removed = kernel.prune_cache(cache, max_bytes=2500)
+    assert sorted(f.name[:2] for f in removed) == ["p0", "p1"]  # too old, then LRU
+    assert sorted(f.name[:2] for f in cache.iterdir()) == ["p2", "p3"]
