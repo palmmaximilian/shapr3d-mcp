@@ -255,6 +255,26 @@ class Measures:
     def total(self, solids) -> float:
         return sum(self.volume(s) for s in solids)
 
+    def gprops(self, solid) -> tuple:
+        """(volume, centroid, inertia) of `solid` at unit density, in its
+        own frame (no placement): centroid a 3-vector, inertia the 3x3
+        volume inertia tensor about the centroid (mm^5). Integrated once
+        per TShape like volume(); callers rotate it into place."""
+        import numpy as np
+        from OCP.BRepGProp import BRepGProp
+        from OCP.GProp import GProp_GProps
+
+        entry = self._entry(solid)
+        if "gprops" not in entry:
+            g = GProp_GProps()
+            BRepGProp.VolumeProperties_s(entry["bare"], g)
+            c, m = g.CentreOfMass(), g.MatrixOfInertia()
+            entry["gprops"] = (
+                g.Mass(), np.array([c.X(), c.Y(), c.Z()]),
+                np.array([[m.Value(r, k) for k in (1, 2, 3)] for r in (1, 2, 3)]))
+            entry.setdefault("volume", g.Mass())
+        return entry["gprops"]
+
 
 def _mesh_nodes(bare):
     """Mesh nodes of a solid in its own frame (numpy N x 3); the mesh is

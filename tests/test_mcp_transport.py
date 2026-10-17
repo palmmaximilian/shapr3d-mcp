@@ -21,6 +21,7 @@ EXPECTED_TOOLS = {
     "create_model", "modify_model", "inspect_model", "convert_model",
     "render_preview", "list_models", "open_in_shapr3d", "shapr3d_status",
     "activate_shapr3d", "screenshot_shapr3d", "build123d_guide",
+    "mass_properties",
 }
 
 

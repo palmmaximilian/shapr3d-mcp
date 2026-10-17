@@ -33,7 +33,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from shapr3d_mcp import kernel, macos
+from shapr3d_mcp import kernel, macos, mass
 
 # build123d logs verbosely at INFO; anything reaching stdout would corrupt
 # the MCP stdio transport, so clamp it before the kernel is imported.
@@ -1102,6 +1102,42 @@ def inspect_model(path: str) -> dict:
         info["parts"] = parts
         info.pop("solids_detail", None)  # parts is the readable view
     return info
+
+
+@_heavy_tool
+def mass_properties(path: str, densities: dict[str, str | float] | None = None,
+                    vendor_masses: dict[str, float] | None = None,
+                    robot: str | None = None,
+                    exclude: list[str] | None = None) -> dict:
+    """Mass, centre of gravity and inertia tensor of a labelled assembly,
+    per top-level part and in total, in the file's world frame (= tool
+    flange for end-effector models: enter the totals as robot payload).
+
+    Args:
+        path: STEP/BREP file with labelled assembly children.
+        densities: label substring -> material name or g/cm3, e.g.
+            {"Bracket": "PA12", "Carriage": "PA12", "Beam": "aluminium",
+            "Screws": "steel", "T-nuts": "steel", "Dowels": "steel"}.
+            Longest matching substring wins; "*" is the default. Names:
+            pa12 (SLS, 0.95), pa12 mjf, pa6/nylon, pla, petg, abs, pom,
+            aluminium/aluminum, steel, stainless, brass, titanium.
+        vendor_masses: label substring -> catalogue kg per matching part,
+            e.g. {"RG2": 0.78, "QC robot side": 0.06}. Overrides densities;
+            density is scaled to it (CoG/inertia assume uniform density).
+        robot: e.g. "UR10e" - checks the total against the payload vs CoG
+            offset curve and warns. Parts whose label contains the robot
+            name are excluded unless `exclude` is given.
+        exclude: label substrings of parts that are not payload.
+    Every remaining part needs a material: unmatched parts raise an error
+    listing them. Inertia in kg*m^2 about the origin and about the CoG
+    (axes parallel to the world frame), mass in kg, CoG in mm.
+    """
+    src = _resolve(path)
+    if not src.exists():
+        raise FileNotFoundError(f"No such file: {src}")
+    shape = _import_cached(src)
+    out = mass.mass_properties(shape, densities, vendor_masses, exclude, robot)
+    return {"file": str(src), **out}
 
 
 @_heavy_tool
