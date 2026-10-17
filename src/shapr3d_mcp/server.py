@@ -1484,6 +1484,41 @@ def section_view(path: str, plane: str = "XZ", offset: float = 0.0,
 
 
 @_heavy_tool
+def create_drawing(path: str, title: str = "", drawing_no: str = "", material: str = "",
+                   project: str = "", scale: int | None = None,
+                   notes: list[str] | None = None) -> dict:
+    """Manufacturing drawing (PDF, A3, German DIN-style title block) of one
+    part: front / top / left views in first-angle projection (hidden lines
+    dashed), overall dimensions and a hole table - every number measured
+    from the solid, nothing typed. The title block has an empty
+    "Geprüft / Freigabe" field: a person must release the drawing.
+
+    Args:
+        path: STEP/BREP of ONE part in its own coordinate system.
+        title / drawing_no / material / project: title block entries.
+        scale: 1:n (n from 1, 2, 5, 10, 20, 50); default = largest that fits.
+        notes: extra lines printed on the sheet (e.g. surface, welding).
+    Returns the PDF path, the scale used and every drawn dimension (so the
+    caller can check them against the model).
+    """
+    from matplotlib.backends.backend_pdf import PdfPages
+    from . import drawing as D
+    src = _resolve(path)
+    if not src.exists():
+        raise FileNotFoundError(f"No such file: {src}")
+    shape = _import_cached(src)
+    info = D.TitleInfo(title=title or src.stem, number=drawing_no or src.stem.upper(),
+                       project=project, material=material or "siehe Stückliste")
+    sheet = D.part_sheet(shape, info, scale=scale, notes=notes or ())
+    out = src.with_name(f"{_safe_name(src.stem)}_zeichnung.pdf")
+    with PdfPages(out) as pdf:
+        dims = sheet.dims
+        sheet.save(pdf)
+    return {"pdf": str(out), "scale": info.scale, "dimensions": dims,
+            "next_step": "Check the PDF visually (it is not released until signed off)."}
+
+
+@_heavy_tool
 def quick_look(path: str, include: list[str] | None = None,
                exclude: list[str] | None = None, plane: str = "XZ",
                offset: float = 0.0) -> dict:
