@@ -43,9 +43,24 @@ VIEWS = {
     "links": ((-1, 0, 0), (0, -1, 0), (0, 0, 1)),
     "rechts": ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
 }
+
+
+def _iso(d):
+    """Isometric basis for viewer direction d: sheet x horizontal, y up-ish."""
+    d = np.asarray(d, float); d /= np.linalg.norm(d)
+    x = np.cross((0, 0, 1), d); x /= np.linalg.norm(x)
+    return tuple(d), tuple(x), tuple(np.cross(d, x))
+
+
+VIEWS["iso"] = _iso((-1, -1, 1))          # from front-left, above
+VIEWS["iso_vr"] = _iso((1, -1, 1))        # from front-right, above
 VIEW_TITLE = {"vorne": "Vorderansicht", "hinten": "Rückansicht", "oben": "Draufsicht",
               "unten": "Untersicht", "links": "Seitenansicht von links",
-              "rechts": "Seitenansicht von rechts"}
+              "rechts": "Seitenansicht von rechts", "iso": "Isometrie", "iso_vr": "Isometrie"}
+
+
+class LayoutError(RuntimeError):
+    """Texts or views on a sheet overlap - the sheet must not be released."""
 
 
 def mm(v) -> str:
@@ -65,8 +80,21 @@ def proj(p, view: str) -> np.ndarray:
     return np.array([p @ x, p @ y])
 
 
+_HLR_CACHE: dict = {}
+
+
 def hlr(shape, view: str) -> dict:
-    """Visible / hidden edges of `shape` seen from `view`, as 2-D polylines in mm."""
+    """Visible / hidden edges of `shape` seen from `view`, as 2-D polylines in mm
+    (cached per shape object and view - assembly isos are reused per sheet)."""
+    key = (id(shape), view)
+    if key in _HLR_CACHE and _HLR_CACHE[key][0] is shape:
+        return _HLR_CACHE[key][1]
+    out = _hlr(shape, view)
+    _HLR_CACHE[key] = (shape, out)
+    return out
+
+
+def _hlr(shape, view: str) -> dict:
     d, x, _ = basis(view)
     algo = HLRBRep_Algo(); algo.Add(shape.wrapped)
     algo.Projector(HLRAlgo_Projector(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(*d), gp_Dir(*x))))
@@ -148,6 +176,7 @@ class Sheet:
     def __init__(self, info: TitleInfo, sheet_no: int = 1):
         self.info, self.no = info, sheet_no
         self.dims: list[dict] = []
+        self.view_boxes: list[tuple] = []          # (name, lo, hi) of placed views
         self.fig = plt.figure(figsize=(A3[0] / 25.4, A3[1] / 25.4))
         self.ax = self.fig.add_axes([0, 0, 1, 1])
         ax = self.ax
@@ -187,7 +216,44 @@ class Sheet:
     def register(self, label, value, text=None):
         self.dims.append({"blatt": self.no, "bezeichnung": label, "wert": value, "text": text})
 
-    def save(self, pdf):
+    def check_layout(self, ignore_text_in_views=True):
+        """Raise LayoutError if texts overlap each other, views overlap each
+        other, or anything leaves the drawing frame."""
+        r = self.fig.canvas.get_renderer()
+        inv = self.ax.transData.inverted()
+        boxes = []
+        for t in self.ax.texts:
+            if not t.get_text().strip() or not t.get_visible():
+                continue
+            bb = t.get_window_extent(r)
+            (x0, y0), (x1, y1) = inv.transform([[bb.x0, bb.y0], [bb.x1, bb.y1]])
+            boxes.append((t.get_text(), x0, y0, x1, y1))
+        probs = []
+        for i in range(len(boxes)):
+            a = boxes[i]
+            if a[1] < 20 or a[3] > 410 or a[2] < 10 or a[4] > 287:
+                probs.append(f"Text außerhalb des Rahmens: {a[0]!r}")
+            for b in boxes[i + 1:]:
+                ox = min(a[3], b[3]) - max(a[1], b[1]); oy = min(a[4], b[4]) - max(a[2], b[2])
+                if ox > 0.3 and oy > 0.3:
+                    probs.append(f"Texte überlappen: {a[0]!r} / {b[0]!r}")
+        for i in range(len(self.view_boxes)):
+            for j in range(i + 1, len(self.view_boxes)):
+                (na, la, ha), (nb, lb, hb) = self.view_boxes[i], self.view_boxes[j]
+                ox = min(ha[0], hb[0]) - max(la[0], lb[0]); oy = min(ha[1], hb[1]) - max(la[1], lb[1])
+                if ox > 0.5 and oy > 0.5:
+                    probs.append(f"Ansichten überlappen: {na} / {nb}")
+        for n, lo, hi in self.view_boxes:
+            if lo[0] < 20 or hi[0] > 410 or lo[1] < 10 or hi[1] > 287:
+                probs.append(f"Ansicht außerhalb des Rahmens: {n}")
+            if hi[0] > 230 and lo[1] < 50:
+                probs.append(f"Ansicht im Schriftfeld: {n}")
+        if probs:
+            raise LayoutError(f"Blatt {self.no}: " + "; ".join(probs))
+
+    def save(self, pdf, check=True):
+        if check:
+            self.check_layout()
         pdf.savefig(self.fig); plt.close(self.fig)
 
 
@@ -196,18 +262,27 @@ class View:
     3-D point `ref3d` lands on `origin`."""
 
     def __init__(self, sheet: Sheet, shape, view: str, scale: float, origin,
-                 ref3d=(0, 0, 0), hidden=True, lw=0.45, title=None):
+                 ref3d=(0, 0, 0), hidden=True, lw=0.45, title=None, color="k",
+                 name=None, register_box=True):
         self.s, self.view, self.k = sheet, view, scale
         self.o = np.asarray(origin, float) - scale * proj(ref3d, view)
         e = hlr(shape, view)
         for pl in e["vis"]:
-            P = self.o + scale * pl; sheet.ax.plot(P[:, 0], P[:, 1], color="k", lw=lw)
+            P = self.o + scale * pl; sheet.ax.plot(P[:, 0], P[:, 1], color=color, lw=lw)
         if hidden:
             for pl in e["hid"]:
                 P = self.o + scale * pl
                 sheet.ax.plot(P[:, 0], P[:, 1], color="0.45", lw=0.25, ls=(0, (3, 2)))
         lo, hi = extent(shape, view)
         self.lo, self.hi = self.o + scale * lo, self.o + scale * hi
+        if register_box:
+            sheet.view_boxes.append((name or view, self.lo, self.hi))
+
+    def overlay(self, shape, color="#d62728", lw=1.1):
+        """Draw another shape (e.g. the part inside the assembly) on top, same
+        projection, visible edges only, highlighted."""
+        for pl in hlr(shape, self.view)["vis"] + hlr(shape, self.view)["hid"]:
+            P = self.o + self.k * pl; self.s.ax.plot(P[:, 0], P[:, 1], color=color, lw=lw, zorder=4)
         if title:
             sheet.ax.text((self.lo[0] + self.hi[0]) / 2, self.lo[1] - 9, title,
                           ha="center", fontsize=7.5, weight="bold")
@@ -245,6 +320,33 @@ def dim(sheet: Sheet, a, b, off, text, horiz=None, size=6.5, register=None):
     ax.text(m[0] - (0.9 if not horiz else 0), m[1] + (0.7 if horiz else 0), text, fontsize=size,
             ha="center" if horiz else "right", va="bottom" if horiz else "center",
             rotation=0 if horiz else 90, rotation_mode="anchor",
+            bbox=dict(boxstyle="square,pad=0.05", fc="white", ec="none"))
+    if register:
+        sheet.register(register[0], register[1], text)
+
+
+def angle_dim(sheet: Sheet, vertex, d1, d2, text, radius=12.0, size=6.5, register=None):
+    """Angle dimension between two lines meeting at `vertex` (sheet mm):
+    extension lines along d1 and d2, an arc with arrowheads between them and
+    the value at the middle of the arc."""
+    from matplotlib.patches import Arc
+    v = np.asarray(vertex, float)
+    d1 = np.asarray(d1, float) / np.linalg.norm(d1); d2 = np.asarray(d2, float) / np.linalg.norm(d2)
+    ax = sheet.ax
+    for d in (d1, d2):                                    # extension lines
+        ax.plot([v[0], v[0] + d[0] * (radius + 3)], [v[1], v[1] + d[1] * (radius + 3)], lw=0.25, color="k")
+    a1, a2 = np.degrees(np.arctan2(d1[1], d1[0])), np.degrees(np.arctan2(d2[1], d2[0]))
+    span = (a2 - a1) % 360
+    if span > 180:                                        # always the inner angle
+        a1, a2, span = a2, a1, 360 - span
+    ax.add_patch(Arc(v, 2 * radius, 2 * radius, theta1=a1, theta2=a1 + span, lw=0.3, color="k"))
+    for ang, sgn in ((a1, 1), (a1 + span, -1)):           # arrowheads tangent to the arc
+        t = np.radians(ang); p = v + radius * np.array([np.cos(t), np.sin(t)])
+        tan = sgn * np.array([-np.sin(t), np.cos(t)])
+        ax.add_patch(FancyArrowPatch(p + tan * 2.2, p, arrowstyle="-|>", mutation_scale=4, lw=0.3,
+                                     color="k", shrinkA=0, shrinkB=0))
+    tm = np.radians(a1 + span / 2); q = v + (radius + 3.2) * np.array([np.cos(tm), np.sin(tm)])
+    ax.text(q[0], q[1], text, fontsize=size, ha="center", va="center",
             bbox=dict(boxstyle="square,pad=0.05", fc="white", ec="none"))
     if register:
         sheet.register(register[0], register[1], text)
@@ -318,10 +420,11 @@ def part_sheet(shape, info: TitleInfo, sheet_no=1, views=("vorne", "oben", "link
             rows.append([i, mm(h["x"] - bb.min.X), mm(h["y"] - bb.min.Y), mm(h["z"] - bb.min.Z),
                          f"Ø{mm(h['d'])}"])
             sh.register(f"Bohrung {i}", [h["x"] - bb.min.X, h["y"] - bb.min.Y, h["z"] - bb.min.Z, h["d"]])
-            for v in (vf, vt):
-                if v:
-                    q = v.pt((h["x"], h["y"], h["z"]))
-                    sh.ax.text(q[0] + 1.5, q[1] + 1.5, str(i), fontsize=5, color="0.2")
+            # number holes in the plan view only - in the front view bores on
+            # the same line project onto each other (layout check would fail)
+            v = vt or vf
+            q = v.pt((h["x"], h["y"], h["z"]))
+            sh.ax.text(q[0] + 1.5, q[1] + 1.5, str(i), fontsize=5, color="0.2")
         yb = table(sh, 300, y1, ["Nr.", "X", "Y", "Z", "Ø"], rows, [10, 22, 22, 22, 20], size=6)
         sh.note(300, yb - 4, ["Bohrungskoordinaten ab Bezugsecke", "(min X / min Y / min Z des Teils)."], 6)
     if notes:
