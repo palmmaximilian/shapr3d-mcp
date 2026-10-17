@@ -426,3 +426,16 @@ def test_section_zoom_writes_separate_file():
     server.section_view("zoom_part.step", plane="XZ", offset=0,
                         zoom_min=[-5, -6], zoom_max=[15, 8])
     assert (WORKDIR / "zoom_part_section_XZ_0_zoom.png").exists()
+
+
+def test_output_names_keep_subfolders_inside_workspace():
+    out = server.create_model("proj_sub/print/part_a", "result = Box(2, 2, 2)", formats=["step", "stl"])
+    assert [Path(f).relative_to(WORKDIR).as_posix() for f in out["files"]] == [
+        "proj_sub/print/part_a.step", "proj_sub/print/part_a.stl"]
+    with pytest.raises(ValueError, match="no '..'"):
+        server.create_model("../escape", "result = Box(1, 1, 1)")
+    script = WORKDIR / "proj_sub" / "build.py"
+    script.write_text("export_part(Box(1, 1, 1), 'proj_sub/print/extra', ['step'])\nresult = Box(3, 3, 3)")
+    out = server.run_model_file("proj_sub/build.py", "proj_sub/asm")
+    rel = sorted(Path(f).relative_to(WORKDIR).as_posix() for f in out["files"])
+    assert rel == ["proj_sub/asm.step", "proj_sub/print/extra.step"]
