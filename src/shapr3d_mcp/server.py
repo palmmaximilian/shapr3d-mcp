@@ -749,9 +749,12 @@ def _replace_previous(prev_name: str, expected: set[int]) -> dict:
         macos.keys("escape")
         return {"deleted": [], "note": "Delete button not found; previous version left in place."}
     macos.click_screen(delete["screen_x"], delete["screen_y"])
-    time.sleep(0.6)
-    _, items = macos.read_ui(shot)
-    if len(macos.item_rows(items)) != len(rows) - 1:
+    for _ in range(6):  # the sidebar takes a moment to drop the row
+        time.sleep(0.6)
+        _, items = macos.read_ui(shot)
+        if len(macos.item_rows(items)) == len(rows) - 1:
+            break
+    else:
         return {"deleted": [], "note": "Deleting the previous version could not be confirmed; check the Items list."}
     return {"deleted": [row["name"] + ("…" if row["truncated"] else "")], "note": ""}
 
