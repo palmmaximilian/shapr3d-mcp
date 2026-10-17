@@ -71,3 +71,31 @@ def test_slow_tool_returns_job_then_wait_job_collects_result():
                 assert _payload(res)["stats"]["volume_mm3"] == 1
 
     asyncio.run(run())
+
+
+def test_bloated_worker_is_recycled_when_idle(monkeypatch):
+    import time
+
+    from shapr3d_mcp import server
+
+    monkeypatch.setattr(server, "_JOB_POOL", None)
+    monkeypatch.setattr(server, "WORKER_MAX_RSS_MB", 0)  # every worker is "bloated"
+    first = server._submit_job(os.getpid).result(timeout=120)
+    for _ in range(200):
+        if server._JOB_POOL is None:
+            break
+        time.sleep(0.05)
+    assert server._JOB_POOL is None
+    second = server._submit_job(os.getpid).result(timeout=120)
+    assert second != first
+
+    # under the limit the worker (and its in-memory shape cache) stays
+    monkeypatch.setattr(server, "WORKER_MAX_RSS_MB", 1e9)
+    pool = server._JOB_POOL
+    try:
+        assert server._submit_job(os.getpid).result(timeout=120) == second
+        time.sleep(0.5)
+        assert server._JOB_POOL is pool
+        assert server._submit_job(os.getpid).result(timeout=120) == second
+    finally:
+        pool.shutdown()

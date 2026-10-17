@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import uuid
@@ -784,10 +785,17 @@ def _shapr3d_history_mentions(needle: str) -> bool:
 # not even to wait_job). If a job finishes within JOB_WAIT_S its result is
 # returned as usual, otherwise the call returns a job handle and wait_job()
 # collects the result later. One long-lived worker: jobs run in call order and
-# its in-memory shape cache survives between calls.
+# its in-memory shape cache survives between calls - until the worker grows
+# past WORKER_MAX_RSS_MB: malloc keeps memory OCCT has freed (~2.7 GB after a
+# quick_look of a big assembly), so an idle worker is then replaced by a fresh
+# one. That drops the in-memory shape cache; the next call re-imports (the
+# on-disk BREP cache still helps).
 
 JOB_WAIT_S = float(os.environ.get("SHAPR3D_MCP_JOB_WAIT_S", "40"))
+WORKER_MAX_RSS_MB = float(os.environ.get("SHAPR3D_MCP_WORKER_MAX_RSS_MB", "3072"))
 _JOB_POOL: ProcessPoolExecutor | None = None
+_JOB_LOCK = threading.Lock()
+_JOBS_IN_POOL = 0  # submitted and not finished
 _JOBS: dict[str, dict] = {}
 
 
@@ -808,12 +816,76 @@ def _job_pool() -> ProcessPoolExecutor:
 
 
 def _submit_job(fn, *args, **kwargs):
+    global _JOB_POOL, _JOBS_IN_POOL
+    with _JOB_LOCK:
+        try:
+            fut = _job_pool().submit(fn, *args, **kwargs)
+        except BrokenProcessPool:
+            _JOB_POOL = None  # worker died (e.g. OCCT crash): start a fresh one
+            fut = _job_pool().submit(fn, *args, **kwargs)
+        _JOBS_IN_POOL += 1
+        pool = _JOB_POOL
+    fut.add_done_callback(lambda _f: _job_done(pool))
+    return fut
+
+
+def _job_done(pool: ProcessPoolExecutor) -> None:
+    global _JOBS_IN_POOL
+    with _JOB_LOCK:
+        _JOBS_IN_POOL -= 1
+        idle = _JOBS_IN_POOL == 0 and pool is _JOB_POOL
+    if idle:
+        # done callbacks run on the pool's own manager thread: check (and
+        # shut the pool down) from another thread
+        threading.Thread(target=_recycle_if_bloated, args=(pool,), daemon=True).start()
+
+
+def _recycle_if_bloated(pool: ProcessPoolExecutor) -> None:
     global _JOB_POOL
+    pids = list(getattr(pool, "_processes", None) or {})
+    rss = max((_process_rss(pid) for pid in pids), default=0)
+    if rss <= WORKER_MAX_RSS_MB * 2**20:
+        return
+    with _JOB_LOCK:
+        if pool is not _JOB_POOL or _JOBS_IN_POOL:
+            return  # a new job arrived meanwhile: keep its worker (and cache)
+        _JOB_POOL = None  # next job starts a fresh worker
+    logging.getLogger(__name__).warning(
+        "job worker at %.1f GB RSS: recycling it", rss / 2**30)
+    pool.shutdown(wait=False)
+
+
+def _process_rss(pid: int) -> int:
+    """Resident set size of a process in bytes (0 if unknown)."""
     try:
-        return _job_pool().submit(fn, *args, **kwargs)
-    except BrokenProcessPool:
-        _JOB_POOL = None  # worker died (e.g. OCCT crash): start a fresh one
-        return _job_pool().submit(fn, *args, **kwargs)
+        if IS_WINDOWS:
+            import ctypes
+            from ctypes import wintypes
+
+            class Counters(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                    (name, ctypes.c_size_t) for name in (
+                        "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                        "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                        "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
+
+            k32 = ctypes.WinDLL("kernel32")
+            k32.OpenProcess.restype = wintypes.HANDLE
+            handle = k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return 0
+            try:
+                c = Counters()
+                c.cb = ctypes.sizeof(c)
+                ok = k32.K32GetProcessMemoryInfo(handle, ctypes.byref(c), c.cb)
+                return c.WorkingSetSize if ok else 0
+            finally:
+                k32.CloseHandle(handle)
+        out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout
+        return int(out.strip() or 0) * 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
 
 
 def _job_running(job_id: str) -> dict:
@@ -1248,7 +1320,15 @@ def _section_png(entries: list[dict], bbox, plane: str, offset: float, out: Path
     fig, ax = plt.subplots(figsize=(width / 100, height / 100), dpi=100)
     palette = plt.get_cmap("tab10")
     parts, colours, areas = [], {}, {}
+    n = pl.z_dir
     for e in entries:
+        # skip the boolean for solids whose loose box misses the plane
+        # (most solids of an assembly)
+        bb = e["solid"].bounding_box(optimal=False)
+        dist = ((bb.min + bb.max) * 0.5 - pl.origin).dot(n)
+        reach = 0.5 * (abs(n.X) * bb.size.X + abs(n.Y) * bb.size.Y + abs(n.Z) * bb.size.Z)
+        if abs(dist) > reach + 1e-6:
+            continue
         faces = kernel.section_faces(e["solid"], pl, size)
         if not faces:
             continue
@@ -1358,7 +1438,8 @@ def quick_look(path: str, include: list[str] | None = None,
                    palette(i % 10)[:3]) for i, n in enumerate(names)]
         _render_png(sub, views, [("iso", 25, -60, False), ("front", 0, -90, True)],
                     1000, 900, False, parts=groups)
-        _section_png(entries, kernel.fast_bbox(sub), plane, offset, sec, 800, 900)
+        # loose box: only sizes the section cutter (fast_bbox re-meshes)
+        _section_png(entries, sub.bounding_box(optimal=False), plane, offset, sec, 800, 900)
         fig, axs = plt.subplots(1, 2, figsize=(18, 9), dpi=100,
                                 gridspec_kw={"width_ratios": [1.1, 1]})
         for ax, img in zip(axs, (views, sec)):
@@ -1479,102 +1560,90 @@ def render_preview(path: str, width: int = 800, height: int = 600,
 
 
 DEFAULT_RGB = (0.35, 0.55, 0.85)
-RENDER_MAX_TRIS = 250_000  # per render (all views share the mesh)
 
 
 def _render_png(shape, out: Path, cams: list[tuple], width: int, height: int,
                 edges: bool, parts: list[tuple] | None = None) -> None:
-    """Render via STL -> matplotlib (no GPU/display needed). `parts` is an
-    optional [(shape, rgb)] list to colour assembly parts separately."""
+    """Render via STL -> numpy z-buffer (raster.py; no GPU/display needed),
+    laid out and labelled with matplotlib. `parts` is an optional
+    [(shape, rgb)] list to colour assembly parts separately."""
     import numpy as np
-    from build123d import export_stl
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
     from OCP.BRepTools import BRepTools
+    from OCP.StlAPI import StlAPI_Writer
+
+    from . import raster
 
     parts = parts or [(shape, DEFAULT_RGB)]
     # tessellate to roughly pixel size: the default 0.001 mm tolerance
-    # turns vendor CAD into millions of triangles matplotlib crawls on
+    # turns vendor CAD into millions of triangles for no visible gain
     # (the loose box is plenty for picking a tolerance)
     diag = shape.bounding_box(optimal=False).diagonal
-    tol, ang = max(diag / 1500, 0.002), 0.5
-    for attempt in range(4):
-        tri_list, nrm_list, rgb_list = [], [], []
-        with tempfile.TemporaryDirectory() as td:
-            for k, (part, rgb) in enumerate(parts):
-                stl_path = Path(td) / f"p{k}.stl"
-                export_stl(part, str(stl_path), tolerance=tol, angular_tolerance=ang)
-                t, n = _read_binary_stl(stl_path)
-                tri_list.append(t)
-                nrm_list.append(n)
-                rgb_list.append(np.tile(np.array(rgb, dtype=float), (len(t), 1)))
-        count = sum(len(t) for t in tri_list)
-        if count <= RENDER_MAX_TRIS or attempt == 3:
-            break
-        # matplotlib holds ~2-3 kB per triangle and view: two gripper-beam
-        # views at 2 M triangles ran past 6 GB. Re-mesh coarser (the mesher
-        # keeps a finer existing mesh, so drop it first).
-        del tri_list, nrm_list, rgb_list
-        for part, _ in parts:
-            BRepTools.Clean_s(part.wrapped)
-        tol *= count / RENDER_MAX_TRIS
-        ang = min(ang * 2, 0.8)
-    tris, normals, base_rgb = (np.concatenate(x) for x in (tri_list, nrm_list, rgb_list))
-    del tri_list, nrm_list, rgb_list
+    tol = max(diag / 1500, 0.002)
+    tri_list, rgb_list = [], []
+    writer = StlAPI_Writer()
+    writer.ASCIIMode = False
+    with tempfile.TemporaryDirectory() as td:
+        for k, (part, rgb) in enumerate(parts):
+            # mesh solid by solid: meshing a whole 240-solid assembly in one
+            # call kept ~0.9 GB of mesher scratch alive, per solid ~0.1 GB.
+            # Instanced solids (screws...) share their mesh, and a fine
+            # enough existing mesh is reused instead of re-checked by the
+            # mesher (seconds on vendor CAD).
+            for piece in part.solids() or [part]:
+                if not BRepTools.Triangulation_s(piece.wrapped, tol, False):
+                    BRepMesh_IncrementalMesh(piece.wrapped, tol, False, 0.5, True)
+            stl_path = Path(td) / f"p{k}.stl"
+            writer.Write(part.wrapped, str(stl_path))
+            t, _ = _read_binary_stl(stl_path)
+            tri_list.append(t)
+            rgb_list.append(np.broadcast_to(np.asarray(rgb, np.float32), (len(t), 3)))
+    tris, base_rgb = np.concatenate(tri_list), np.concatenate(rgb_list)
+    del tri_list, rgb_list
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
+    from matplotlib.collections import LineCollection
 
-    edge_lines = []
+    edge_polys = []
     if edges:
         all_edges = shape.edges()
         if len(all_edges) <= 5000:  # meshes (STL) have one edge per triangle side
             for e in all_edges:
                 n = 2 if e.geom_type.name == "LINE" else 24
                 pts = [e.position_at(i / (n - 1)) for i in range(n)]
-                xyz = [(p.X, p.Y, p.Z) for p in pts]
-                # Line3DCollection needs equal-length segments: use pairs.
-                edge_lines.extend(zip(xyz[:-1], xyz[1:]))
+                edge_polys.append(np.array([(p.X, p.Y, p.Z) for p in pts]))
 
-    lo, hi = tris.reshape(-1, 3).min(axis=0), tris.reshape(-1, 3).max(axis=0)
-    center, span = (lo + hi) / 2, (hi - lo).max() / 2 or 1
-    size = hi - lo
+    pts = tris.reshape(-1, 3)
+    lo, hi = pts.min(axis=0).astype(float), pts.max(axis=0).astype(float)
+    center, size = (lo + hi) / 2, hi - lo
+    corners = np.array([[x, y, z] for x in (lo[0], hi[0])
+                        for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
 
     cols = 1 if len(cams) == 1 else 2
     rows = (len(cams) + cols - 1) // cols
     fig = plt.figure(figsize=(width / 100, height / 100), dpi=100)
     for i, (label, elev, azim, ortho) in enumerate(cams):
-        ax = fig.add_subplot(rows, cols, i + 1, projection="3d")
-        if ortho:
-            ax.set_proj_type("ortho")
-        # Headlight from the camera, nudged up-left so faces square to the
-        # view still differ from their neighbours.
-        e, a = np.radians(elev), np.radians(azim)
-        cam = np.array([np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e)])
-        light = cam + 0.35 * np.array([-np.sin(a), np.cos(a), 0.6])
-        light = light / np.linalg.norm(light)
-        # back faces of closed solids are hidden anyway: skip them (halves
-        # matplotlib's memory and time; margin for perspective views)
-        front = normals @ cam > -0.2
-        shade = 0.3 + 0.7 * np.clip(normals[front] @ light, 0, 1)
-        colors = base_rgb[front] * shade[:, None]
-        # Stroke each triangle in its own colour: with edgecolor="none" the
-        # antialiased gaps between triangles show up as light seams.
-        coll = Poly3DCollection(
-            tris[front], facecolors=colors, edgecolors=colors, linewidths=0.4
-        )
-        ax.add_collection3d(coll)
-        if edge_lines:
-            ax.add_collection3d(
-                Line3DCollection(edge_lines, colors="#111111", linewidths=0.6)
-            )
-        # box aspect = real extents, so tall/flat parts fill the frame
-        ext = np.maximum(size, 1e-3 * max(size.max(), 1))
-        for setter, c, h in zip((ax.set_xlim, ax.set_ylim, ax.set_zlim), center, ext / 2):
-            setter(c - h, c + h)
-        ax.set_box_aspect(ext, zoom=1.0)
+        ax = fig.add_subplot(rows, cols, i + 1)
+        pos = ax.get_position()
+        w_px, h_px = max(int(pos.width * width), 8), max(int(pos.height * height), 8)
+        cam = raster.Camera(elev, azim, ortho, center, np.linalg.norm(size) / 2)
+        # fit the bounding box (as mplot3d's box aspect did) with a margin
+        bx, by, _ = cam.project(corners)
+        scale = 0.92 * min(w_px / max(np.ptp(bx), 1e-9), h_px / max(np.ptp(by), 1e-9))
+        canvas = raster.Canvas(w_px, h_px, scale,
+                               (bx.max() + bx.min()) / 2, (by.max() + by.min()) / 2)
+        canvas.draw(tris, raster.shade(tris, base_rgb, cam), cam)
+        ax.imshow(canvas.image(), extent=(0, w_px, h_px, 0))
+        if edge_polys:  # drawn on top, hidden edges included (wireframe)
+            segs = []
+            for poly in edge_polys:
+                ex, ey = canvas.to_px(*cam.project(poly)[:2])
+                segs.append(np.column_stack([ex, ey]) / raster.SUPERSAMPLE)
+            ax.add_collection(LineCollection(segs, colors="#111111", linewidths=0.6))
+        del canvas
         ax.set_axis_off()
-        ax.view_init(elev=elev, azim=azim)
         if len(cams) > 1 or label != "iso":
             ax.set_title(label, fontsize=9)
     fig.suptitle(
@@ -2219,7 +2288,7 @@ def _preload_native_modules() -> None:
     import matplotlib.pyplot  # noqa: F401
     import numpy  # noqa: F401
     import yaml  # noqa: F401
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection  # noqa: F401
+    from matplotlib.collections import LineCollection  # noqa: F401
     from OCP.IFSelect import IFSelect_RetDone  # noqa: F401
     from OCP.IGESControl import IGESControl_Reader  # noqa: F401
     from OCP.Message import Message  # noqa: F401

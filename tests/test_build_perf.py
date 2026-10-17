@@ -1,5 +1,5 @@
 """Fast paths of the build report: mesh-based bboxes, shared volumes,
-capped render meshes."""
+z-buffer renders."""
 
 from build123d import Box, Compound, Cylinder, Pos, Rot, Sphere
 
@@ -38,11 +38,31 @@ def test_volume_memo_shares_moved_copies(monkeypatch):
     assert abs(memo.volume(other) - 6) < 1e-9 and len(calls) == 2
 
 
-def test_render_caps_triangles(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "RENDER_MAX_TRIS", 500)
+def test_rasterizer_z_test_and_background():
+    import numpy as np
+    from shapr3d_mcp import raster
+
+    # front view (camera at -Y): red square in front of a wider blue one
+    def quad(y, x0, x1):
+        a, b, c, d = [x0, y, 0], [x1, y, 0], [x1, y, 10], [x0, y, 10]
+        return [[a, b, c], [a, c, d]]
+    tris = np.array(quad(-5, 0, 10) + quad(5, -5, 15), dtype=np.float32)
+    rgb = np.array([[1, 0, 0]] * 2 + [[0, 0, 1]] * 2, dtype=np.float32)
+    for ortho in (True, False):
+        cam = raster.Camera(0, -90, ortho, np.array([5.0, 0, 5]), 10)
+        canvas = raster.Canvas(40, 40, 1.5, 0, 0)
+        canvas.draw(tris, raster.shade(tris, rgb, cam), cam)
+        img = canvas.image()
+        assert img[20, 20][0] > 0.5 and img[20, 20][2] < 0.05  # red wins
+        assert img[20, 8][2] > 0.3 and img[20, 8][0] < 0.05    # blue beside it
+        assert (img[0, 0] == 1).all()                          # white background
+
+
+def test_render_png_views_and_edges(tmp_path):
     out = tmp_path / "r.png"
-    server._render_png(Sphere(20), out, [("iso", 30, -60, False)], 200, 200, False)
-    assert out.exists()
+    server._render_png(Sphere(20), out, [("iso", 30, -60, False), ("top", 90, -90, True)],
+                       300, 200, True)
+    assert out.stat().st_size > 1000
 
 
 def test_shape_cache_replaces_stale_version(tmp_path, monkeypatch):
