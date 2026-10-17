@@ -147,6 +147,12 @@ def test_keys_types_text(fake_mac, monkeypatch):
 # open_in_shapr3d: iterate in the open project unless asked for a new one
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def fresh_import_manifest(tmp_path, monkeypatch):
+    """Import versions are counted per model in a manifest: start each test clean."""
+    monkeypatch.setattr(server, "IMPORTS_MANIFEST", tmp_path / "imports.json")
+
+
 @pytest.fixture
 def fake_import(monkeypatch):
     scripts = []
@@ -286,7 +292,7 @@ NEW = row("› O iterate_me", 147)
 def test_reimport_deletes_previous_version(screens, fake_import):
     # replace: list -> selected -> deleted; confirm: before (0) -> arrived (1)
     screens["screens"] = [SIDEBAR + [OLD], SELECTED, SIDEBAR, SIDEBAR, SIDEBAR + [NEW]]
-    msg = server.open_in_shapr3d("iterate_me.step")
+    msg = server.open_in_shapr3d("iterate_me.step", versioned=False)
     assert len(fake_import) == 1  # imported once
     assert screens["clicks"] == [(OLD["screen_x"], OLD["screen_y"]), (320, 779 + 34)]
     assert "Replaced the previous version (iterate_me)" in msg
@@ -295,7 +301,7 @@ def test_reimport_deletes_previous_version(screens, fake_import):
 def test_reimport_keeps_item_with_other_body_count(screens):
     other = SELECTED[:-2] + [row("7 bodies", 328, 270), row("Delete", 779, 270)]
     screens["screens"] = [SIDEBAR + [OLD], other, SIDEBAR + [OLD], SIDEBAR + [OLD, NEW]]
-    msg = server.open_in_shapr3d("iterate_me.step")
+    msg = server.open_in_shapr3d("iterate_me.step", versioned=False)
     assert len(screens["clicks"]) == 1 and screens["keys"] == ["escape"]
     assert "7 bodies" in msg and "left in place" in msg
 
@@ -303,29 +309,54 @@ def test_reimport_keeps_item_with_other_body_count(screens):
 def test_reimport_ambiguous_names_left_alone(screens):
     two = SIDEBAR + [row("› O iterate_m...", 147), row("› O iterate_me", 171)]
     screens["screens"] = [two, two, two + [row("› O iterate_me", 195)]]
-    msg = server.open_in_shapr3d("iterate_me.step")
+    msg = server.open_in_shapr3d("iterate_me.step", versioned=False)
     assert screens["clicks"] == [] and "left them all in place" in msg
 
 
 def test_new_model_is_added_not_replacing(screens):
     screens["screens"] = [SIDEBAR + [row("› O bracket", 147)]] * 2 + [
         SIDEBAR + [row("› O bracket", 147), row("› O iterate_me", 171)]]
-    msg = server.open_in_shapr3d("iterate_me.step")
+    msg = server.open_in_shapr3d("iterate_me.step", versioned=False)
     assert screens["clicks"] == [] and "Replaced" not in msg
 
 
 def test_failed_import_restores_deleted_version(screens, fake_import):
     screens["screens"] = [SIDEBAR + [OLD], SELECTED, SIDEBAR]  # nothing arrives
     with pytest.raises(RuntimeError, match="restored"):
-        server.open_in_shapr3d("iterate_me.step")
+        server.open_in_shapr3d("iterate_me.step", versioned=False)
     assert screens["keys"] == ["cmd+z"]
     assert len(fake_import) == 1  # never re-imported: a slow import would duplicate
 
 
 def test_replace_false_never_touches_items(screens):
     screens["screens"] = [SIDEBAR + [OLD], SIDEBAR + [OLD, NEW]]
-    server.open_in_shapr3d("iterate_me.step", replace=False)
+    server.open_in_shapr3d("iterate_me.step", replace=False, versioned=False)
     assert screens["clicks"] == []
+
+
+def test_versioned_import_names_copy_and_deletes_previous_by_name(screens, fake_import):
+    # manifest says v1 was imported last: the v1 row is deleted by name alone
+    # (no body-count check), and the new import arrives as iterate_me_v2
+    server.IMPORTS_MANIFEST.write_text('{"iterate_me": {"bodies": 99, "version": 1}}')
+    v1, v2 = row("› O iterate_me_v1", 147), row("› O iterate_me_v2", 147)
+    sel = SIDEBAR + [v1, row("Delete", 779, 270)]
+    screens["screens"] = [SIDEBAR + [v1], sel, SIDEBAR, SIDEBAR, SIDEBAR + [v2]]
+    msg = server.open_in_shapr3d("iterate_me.step")
+    assert "iterate_me_v2.step" in fake_import[0]
+    assert screens["clicks"] == [(v1["screen_x"], v1["screen_y"]), (320, 779 + 34)]
+    assert "Replaced the previous version (iterate_me_v1)" in msg
+    assert '"version": 2' in server.IMPORTS_MANIFEST.read_text()
+
+
+def test_first_versioned_import_checks_legacy_item_body_count(screens, fake_import):
+    # no version recorded yet: an unversioned item of the same name is only
+    # replaced when its body count matches, as before
+    other = SELECTED[:-2] + [row("7 bodies", 328, 270), row("Delete", 779, 270)]
+    v1 = row("› O iterate_me_v1", 147)
+    screens["screens"] = [SIDEBAR + [OLD], other, SIDEBAR + [OLD], SIDEBAR + [OLD, v1]]
+    msg = server.open_in_shapr3d("iterate_me.step")
+    assert "iterate_me_v1.step" in fake_import[0]
+    assert "left in place" in msg
 
 
 def test_body_count_tolerance():

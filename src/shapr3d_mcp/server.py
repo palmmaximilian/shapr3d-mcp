@@ -657,6 +657,7 @@ def _activate_app() -> None:
 
 
 IMPORTS_MANIFEST = WORKDIR / ".shapr3d_imports.json"
+VERSIONS_DIR = WORKDIR / "_shapr3d_versions"  # <stem>_v<N> copies that get imported
 
 
 def _body_count(src: Path) -> int:
@@ -668,56 +669,81 @@ def _body_count(src: Path) -> int:
     return len(kernel.load_cad(src, _import_any, CACHE_DIR).solids())
 
 
-def _remember_import(src: Path) -> None:
-    """Record how many bodies this model had when imported, so a later
-    re-import can recognise its previous version in the Items sidebar."""
+def _import_record(stem: str) -> dict:
+    """{"bodies": n, "version": v} recorded at the last import of `stem`
+    (older manifests stored just the body count)."""
+    import json
+
+    try:
+        rec = json.loads(IMPORTS_MANIFEST.read_text()).get(stem) if IMPORTS_MANIFEST.exists() else None
+    except Exception:
+        rec = None
+    if isinstance(rec, int):
+        return {"bodies": rec, "version": 0}
+    return rec or {}
+
+
+def _remember_import(stem: str, src: Path, version: int) -> None:
+    """Record the body count and version number of this import, so a later
+    re-import can find its previous version in the Items sidebar."""
     import json
 
     try:
         data = json.loads(IMPORTS_MANIFEST.read_text()) if IMPORTS_MANIFEST.exists() else {}
-        data[src.stem] = _body_count(src)
+        data[stem] = {"bodies": _body_count(src), "version": version}
         IMPORTS_MANIFEST.write_text(json.dumps(data, indent=1))
     except Exception:
         pass  # bookkeeping only
 
 
-def _replace_previous(src: Path) -> dict:
-    """Delete the previous import of this model from the open project if it
-    can be identified unambiguously (see open_in_shapr3d's `replace`)."""
-    import json
+def _versioned_copy(src: Path, version: int) -> Path:
+    """Copy of `src` named <stem>_v<N>: Shapr3D names the imported item
+    after the file, so every version is told apart by its name."""
+    import shutil
 
+    out = VERSIONS_DIR / f"{src.stem}_v{version}{src.suffix}"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, out)
+    return out
+
+
+def _replace_previous(prev_name: str, expected: set[int]) -> dict:
+    """Delete the item `prev_name` (the previous import) from the open
+    project if it can be identified unambiguously (see open_in_shapr3d's
+    `replace`). A fully visible versioned name is proof enough; an
+    unversioned or truncated name must also match the expected body count."""
     shot = WORKDIR / "_shapr3d_ui.png"
     _, items = macos.read_ui(shot)
     rows = macos.item_rows(items)
     if not rows:
         return {"deleted": [], "note": "Items sidebar not visible; previous version (if any) left in place."}
-    matches = [r for r in rows if macos.name_matches(r, src.stem)]
+    matches = [r for r in rows if macos.name_matches(r, prev_name)]
     if not matches:
-        return {"deleted": [], "note": ""}  # new model: just add it
+        return {"deleted": [], "note": ""}  # new model / already gone: just add it
     if len(matches) > 1:
         return {"deleted": [], "note": (
-            f"{len(matches)} items look like '{src.stem}' "
+            f"{len(matches)} items look like '{prev_name}' "
             f"({', '.join(m['text'] for m in matches)}); left them all in place.")}
     row = matches[0]
-    try:
-        known = json.loads(IMPORTS_MANIFEST.read_text()).get(src.stem) if IMPORTS_MANIFEST.exists() else None
-    except Exception:
-        known = None
-    expected = {known, _body_count(src)} - {None}
+    exact = not row["truncated"] and bool(re.search(r"_v\d+$", prev_name))
     macos.activate()
     macos.click_screen(row["screen_x"], row["screen_y"])
-    count = None
-    for _ in range(8):  # the "N bodies" label takes a moment on big models
+    if not exact:
+        count = None
+        for _ in range(8):  # the "N bodies" label takes a moment on big models
+            time.sleep(0.5)
+            _, items = macos.read_ui(shot)
+            count = macos.selected_body_count(items)
+            if count is not None:
+                break
+        if not macos.body_count_close(count, expected):
+            macos.keys("escape")
+            return {"deleted": [], "note": (
+                f"'{row['name']}' has {count} bodies, expected {sorted(expected)}; "
+                "not sure it's the previous version, so it was left in place.")}
+    else:
         time.sleep(0.5)
         _, items = macos.read_ui(shot)
-        count = macos.selected_body_count(items)
-        if count is not None:
-            break
-    if not macos.body_count_close(count, expected):
-        macos.keys("escape")
-        return {"deleted": [], "note": (
-            f"'{row['name']}' has {count} bodies, expected {sorted(expected)}; "
-            "not sure it's the previous version, so it was left in place.")}
     delete = macos.match_text("Delete", items)
     if not delete:
         macos.keys("escape")
@@ -1750,7 +1776,7 @@ IMPORT_DIALOG_NOTE = (
 
 @_heavy_tool
 def open_in_shapr3d(path: str, new_project: bool | None = None,
-                    replace: bool = True) -> str:
+                    replace: bool = True, versioned: bool = True) -> str:
     """Open a CAD file in Shapr3D as a real editable body.
 
     Verified against Shapr3D 26.143.0 - two things the original approach got
@@ -1789,6 +1815,10 @@ def open_in_shapr3d(path: str, new_project: bool | None = None,
             it is left alone and reported. If the new import can't be
             confirmed, the deletion is undone. A file with a new name is
             simply added. Pass False to keep the old version.
+        versioned: Import a copy named <name>_v<N> (N counts up per model),
+            so versions are told apart by name in the Items list and the
+            replace step deletes exactly the previous one (`<name>_v<N-1>`)
+            instead of guessing from body counts.
 
     Raises:
         RuntimeError: if the History panel doesn't show this file as imported
@@ -1853,9 +1883,16 @@ def open_in_shapr3d(path: str, new_project: bool | None = None,
         '''
         _osascript(script)
 
+    stem = src.stem
+    rec = _import_record(stem)
+    prev_version = rec.get("version", 0)
+    version = prev_version + 1 if versioned else 0
+    if versioned:
+        src = _versioned_copy(src, version)
     replaced: dict = {"deleted": [], "note": ""}
     if replace and not new_project and sys.platform == "darwin":
-        replaced = _replace_previous(src)
+        prev_name = f"{stem}_v{prev_version}" if prev_version else stem
+        replaced = _replace_previous(prev_name, {rec.get("bodies"), _body_count(src)} - {None})
 
     needle = f'Import "{src.name}"'
     # Confirm via the Items sidebar (one more top-level item with this
@@ -1888,7 +1925,7 @@ def open_in_shapr3d(path: str, new_project: bool | None = None,
                 break
             time.sleep(0.7)
         if confirmed:
-            _remember_import(src)
+            _remember_import(stem, src, version)
             note = ""
             if replaced["deleted"]:
                 note = f" Replaced the previous version ({', '.join(replaced['deleted'])})."
