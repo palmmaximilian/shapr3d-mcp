@@ -45,7 +45,7 @@ forward briefly. Run `check_permissions` once at the start.
 | `diff_models` | What changed between two versions (e.g. after the user edited in Shapr3D): added/removed regions, new/removed faces |
 | `inspect_model` | Solids, bounding box, volume, face/edge counts; per-part inventory for labelled assemblies |
 | `convert_model` | Read STEP / IGES / STL / BREP / 3MF, write STEP / STL / 3MF / glTF / GLB / BREP |
-| `render_preview` | Shaded PNG preview (iso / standard views / custom angle, optional edge overlay) without opening any app |
+| `render_preview` | Colour PNG preview: one colour per assembly part (or per `colors` label match), lighting, outlines, legend; iso / standard views / custom angle, optional edge overlay - without opening any app |
 | `list_models` | List files in the models workspace |
 | `open_in_shapr3d` | Open a file in Shapr3D (STEP imports as editable bodies) |
 | `activate_shapr3d` / `shapr3d_status` | Launch / check the app |

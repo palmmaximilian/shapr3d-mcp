@@ -1639,10 +1639,15 @@ def render_preview(path: str, width: int = 800, height: int = 600,
                    views: list[str] | None = None,
                    elevation: float | None = None,
                    azimuth: float | None = None,
-                   edges: bool = False) -> Image:
+                   edges: bool = False,
+                   colors: dict[str, str | list[float]] | None = None,
+                   palette: str | list[str | list[float]] | None = None,
+                   outlines: bool = True,
+                   legend: bool = True) -> Image:
     """Render a PNG preview of a CAD file (STEP/IGES/STL/BREP/3MF) without
     opening Shapr3D. Useful to visually verify a model you just created
-    before sending it to the app.
+    before sending it to the app. Assemblies get one colour per top-level
+    child (part), soft lighting and dark outlines, so parts stay readable.
 
     Args:
         views: One or more of iso, front, back, left, right, top, bottom,
@@ -1652,6 +1657,15 @@ def render_preview(path: str, width: int = 800, height: int = 600,
             `views` with a single custom view.
         edges: Overlay B-rep edges as dark lines (drawn through the part,
             like a wireframe, so hidden edges also show).
+        colors: Part colours by label substring (case/punctuation-
+            insensitive, first match wins), e.g. {"frame": "#ee8c2e",
+            "UR16e": [0.95, 0.95, 0.96]}. Hex, CSS names, or rgb in 0-1 or
+            0-255. Unmatched parts take the next palette colour.
+        palette: Auto colours for the other parts: a matplotlib colormap
+            name (e.g. "tab20", "Set2") or a list of colours. Default: a
+            10-colour qualitative palette.
+        outlines: Dark feature-edge outlines (silhouettes, sharp edges).
+        legend: Part -> colour key under the picture (assemblies only).
     """
     src = _resolve(path)
     if not src.exists():
@@ -1671,9 +1685,223 @@ def render_preview(path: str, width: int = 800, height: int = 600,
                 f"{sorted(VIEW_PRESETS)} or 'all'."
             )
         cams = [(v, *VIEW_PRESETS[v], v != "iso") for v in names]
+    groups = _colour_groups(shape, src.stem, colors, palette)
     out = WORKDIR / (_safe_name(src.stem) + "_preview.png")
-    _render_png(shape, out, cams, width, height, edges)
+    try:
+        _render_colour_png(shape, groups, out, cams, width, height, edges,
+                           outlines, legend)
+    except Exception as exc:  # no VTK / no OpenGL: flat numpy renderer
+        logging.getLogger(__name__).warning("VTK render failed (%s); "
+                                            "falling back to raster", exc)
+        _render_png(shape, out, cams, width, height, edges,
+                    parts=[(g, rgb) for _, g, rgb in groups])
     return Image(path=str(out))
+
+
+# Tableau 10: distinct hues that stay readable when shaded
+DEFAULT_PALETTE = ["#4c78a8", "#f58518", "#54a24b", "#e45756", "#72b7b2",
+                   "#eeca3b", "#b279a2", "#ff9da6", "#9d755d", "#bab0ac"]
+
+
+def _parse_rgb(c) -> tuple[float, float, float]:
+    """Hex / CSS name / rgb (0-1 or 0-255) -> rgb floats in 0-1."""
+    if isinstance(c, str):
+        from matplotlib.colors import to_rgb
+        c = c.strip()
+        if re.fullmatch(r"[0-9a-fA-F]{6}", c):
+            c = "#" + c
+        return tuple(float(v) for v in to_rgb(c))
+    vals = [float(v) for v in c]
+    if len(vals) not in (3, 4):
+        raise ValueError(f"Colour {c!r} needs 3 components")
+    vals = vals[:3]
+    if max(vals) > 1:
+        vals = [v / 255 for v in vals]
+    return tuple(min(max(v, 0.0), 1.0) for v in vals)
+
+
+def _palette_rgbs(palette, n: int) -> list[tuple]:
+    if palette is None:
+        cols = [_parse_rgb(c) for c in DEFAULT_PALETTE]
+    elif isinstance(palette, str):
+        import matplotlib
+        try:
+            cmap = matplotlib.colormaps[palette]
+        except KeyError:
+            raise ValueError(f"Unknown palette {palette!r}; use a matplotlib "
+                             "colormap name or a list of colours") from None
+        k = getattr(cmap, "N", 256)
+        if k <= 32:  # qualitative: take its colours in order
+            cols = [tuple(cmap(i)[:3]) for i in range(k)]
+        else:
+            cols = [tuple(cmap(i / max(n - 1, 1))[:3]) for i in range(max(n, 1))]
+    else:
+        cols = [_parse_rgb(c) for c in palette]
+    if not cols:
+        raise ValueError("palette is empty")
+    return [cols[i % len(cols)] for i in range(n)]
+
+
+def _colour_groups(shape, file_tag: str, colors=None, palette=None) -> list[tuple]:
+    """[(label, shape, rgb)]: one group per top-level assembly child, or the
+    whole shape. `colors` (label substring -> colour) wins over the palette."""
+    shape = kernel.unwrap_groups(shape)
+    children = list(getattr(shape, "children", []) or [])
+    if len(children) > 1:
+        names = kernel.child_names(shape, file_tag) or [
+            f"{file_tag}[{i}]" for i in range(len(children))]
+        parts = list(zip(names, children))
+    else:
+        parts = [(file_tag, shape)]
+    wanted = [(kernel.norm(k), _parse_rgb(v)) for k, v in (colors or {}).items()]
+    fixed = [next((rgb for k, rgb in wanted if k in kernel.norm(name)), None)
+             for name, _ in parts]
+    if len(parts) == 1 and palette is None and fixed[0] is None:
+        auto = iter([DEFAULT_RGB])  # single part keeps the familiar blue
+    else:
+        auto = iter(_palette_rgbs(palette, sum(f is None for f in fixed)))
+    return [(name, part, rgb if rgb is not None else next(auto))
+            for (name, part), rgb in zip(parts, fixed)]
+
+
+def _mesh_triangles(part, tol: float, stl_path: Path):
+    """(N, 3, 3) float32 triangles of `part`. Meshed solid by solid: one
+    call on a 240-solid assembly kept ~0.9 GB of mesher scratch alive, per
+    solid ~0.1 GB. Instanced solids (screws...) share their mesh, and a fine
+    enough existing mesh is reused instead of re-checked by the mesher
+    (seconds on vendor CAD). The STL writer skips faces the mesher could
+    not triangulate (some vendor faces), where tessellate() would crash."""
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.BRepTools import BRepTools
+    from OCP.StlAPI import StlAPI_Writer
+
+    for piece in part.solids() or [part]:
+        if not BRepTools.Triangulation_s(piece.wrapped, tol, False):
+            BRepMesh_IncrementalMesh(piece.wrapped, tol, False, 0.5, True)
+    writer = StlAPI_Writer()
+    writer.ASCIIMode = False
+    writer.Write(part.wrapped, str(stl_path))
+    return _read_binary_stl(stl_path)[0]
+
+
+def _mesh_tolerance(shape) -> float:
+    """Linear deflection of roughly a pixel: the default 0.001 mm turns
+    vendor CAD into millions of triangles for no visible gain (the loose
+    box is plenty for picking a tolerance)."""
+    return max(shape.bounding_box(optimal=False).diagonal / 1500, 0.002)
+
+
+def _part_tolerance(part, tol: float) -> float:
+    """Face-heavy vendor parts (robot arms, control boxes) mesh coarser:
+    their detail is far below a pixel and the triangle count dominates."""
+    n_faces = len(part.faces())
+    return tol * min(max((n_faces / 2000) ** 0.5, 1.0), 4.0)
+
+
+def _edge_polylines(shape):
+    """B-rep edges as polylines (points, offsets), or None for meshes (STL
+    has one edge per triangle side) and very busy models."""
+    import numpy as np
+
+    all_edges = shape.edges()
+    if not all_edges or len(all_edges) > 5000:
+        return None
+    pts, offsets = [], [0]
+    for e in all_edges:
+        n = 2 if e.geom_type.name == "LINE" else 24
+        pts += [tuple(e.position_at(i / (n - 1))) for i in range(n)]
+        offsets.append(len(pts))
+    return np.asarray(pts, np.float32), np.asarray(offsets, np.int64)
+
+
+VTK_TIMEOUT_S = 300
+
+
+def _trim_white(png: str, margin: int = 12):
+    """Image array cropped to its non-white content plus a margin (the
+    bounding-box fit leaves slack around rounded or oblique models)."""
+    import numpy as np
+    from PIL import Image as PILImage, ImageChops
+
+    im = PILImage.open(png).convert("RGB")
+    bb = ImageChops.difference(im, PILImage.new("RGB", im.size, (255, 255, 255))).getbbox()
+    if bb:
+        im = im.crop((max(0, bb[0] - margin), max(0, bb[1] - margin),
+                      min(im.width, bb[2] + margin), min(im.height, bb[3] + margin)))
+    return np.asarray(im)
+
+
+def _render_colour_png(shape, groups: list[tuple], out: Path, cams: list[tuple],
+                       width: int, height: int, edges: bool, outlines: bool,
+                       legend: bool) -> None:
+    """Mesh here (OCC), render each view with VTK in a child process (see
+    vtkrender.py for why), then lay the views out with matplotlib."""
+    import json
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    tol = _mesh_tolerance(shape)
+    show_legend = legend and len(groups) > 1
+    cols = 1 if len(cams) == 1 else 2
+    rows = (len(cams) + cols - 1) // cols
+    fig = plt.figure(figsize=(width / 100, height / 100), dpi=100)
+    axes = [fig.add_subplot(rows, cols, i + 1) for i in range(len(cams))]
+    with tempfile.TemporaryDirectory() as td:
+        arrays, colours = {}, []
+        lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
+        for k, (_, part, rgb) in enumerate(groups):
+            t = _mesh_triangles(part, _part_tolerance(part, tol), Path(td) / f"p{k}.stl")
+            arrays[f"t{k}"] = t
+            colours.append(list(rgb))
+            if len(t):
+                p = t.reshape(-1, 3)
+                lo, hi = np.minimum(lo, p.min(axis=0)), np.maximum(hi, p.max(axis=0))
+        if not np.isfinite(lo).all():
+            raise RuntimeError("Nothing to render: no triangulated faces")
+        if edges and (poly := _edge_polylines(shape)) is not None:
+            arrays["edge_pts"], arrays["edge_offsets"] = poly
+        np.savez(Path(td) / "mesh.npz", **arrays)
+        del arrays
+        view_specs = []
+        for i, ((_, elev, azim, ortho), ax) in enumerate(zip(cams, axes)):
+            pos = ax.get_position()
+            # 2x, then trimmed and scaled down by imshow: crisp lines
+            view_specs.append({"elev": elev, "azim": azim, "ortho": ortho,
+                               "width": 2 * max(int(pos.width * width), 8),
+                               "height": 2 * max(int(pos.height * height), 8),
+                               "out": str(Path(td) / f"view{i}.png")})
+        spec = Path(td) / "spec.json"
+        spec.write_text(json.dumps({
+            "arrays": str(Path(td) / "mesh.npz"), "colors": colours,
+            "views": view_specs, "outlines": outlines, "edges": edges,
+            "line_width": 2.0}))
+        proc = subprocess.run(
+            [sys.executable, "-m", "shapr3d_mcp.vtkrender", str(spec)],
+            capture_output=True, text=True, timeout=VTK_TIMEOUT_S)
+        if proc.returncode != 0 or not all(Path(v["out"]).exists() for v in view_specs):
+            plt.close(fig)
+            tail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
+            raise RuntimeError(f"vtkrender exit {proc.returncode}: {' | '.join(tail)}")
+        for (label, *_), ax, v in zip(cams, axes, view_specs):
+            ax.imshow(_trim_white(v["out"]))
+            ax.set_axis_off()
+            if len(cams) > 1 or label != "iso":
+                ax.set_title(label, fontsize=9)
+    size = hi - lo
+    caption = f"{size[0]:.1f} x {size[1]:.1f} x {size[2]:.1f} mm (X x Y x Z)"
+    if show_legend:
+        handles = [Patch(facecolor=rgb, edgecolor="#333333", linewidth=0.5,
+                         label=name) for name, _, rgb in groups[:24]]
+        fig.legend(handles=handles, loc="lower center", ncol=min(4, len(handles)),
+                   fontsize=7, frameon=False, bbox_to_anchor=(0.5, -0.01),
+                   title=caption, title_fontsize=8)
+    else:
+        fig.suptitle(caption, fontsize=8, y=0.02, va="bottom")
+    fig.savefig(out, bbox_inches="tight", pad_inches=0.05)
+    plt.close(fig)
 
 
 DEFAULT_RGB = (0.35, 0.55, 0.85)
@@ -1685,34 +1913,15 @@ def _render_png(shape, out: Path, cams: list[tuple], width: int, height: int,
     laid out and labelled with matplotlib. `parts` is an optional
     [(shape, rgb)] list to colour assembly parts separately."""
     import numpy as np
-    from OCP.BRepMesh import BRepMesh_IncrementalMesh
-    from OCP.BRepTools import BRepTools
-    from OCP.StlAPI import StlAPI_Writer
 
     from . import raster
 
     parts = parts or [(shape, DEFAULT_RGB)]
-    # tessellate to roughly pixel size: the default 0.001 mm tolerance
-    # turns vendor CAD into millions of triangles for no visible gain
-    # (the loose box is plenty for picking a tolerance)
-    diag = shape.bounding_box(optimal=False).diagonal
-    tol = max(diag / 1500, 0.002)
+    tol = _mesh_tolerance(shape)
     tri_list, rgb_list = [], []
-    writer = StlAPI_Writer()
-    writer.ASCIIMode = False
     with tempfile.TemporaryDirectory() as td:
         for k, (part, rgb) in enumerate(parts):
-            # mesh solid by solid: meshing a whole 240-solid assembly in one
-            # call kept ~0.9 GB of mesher scratch alive, per solid ~0.1 GB.
-            # Instanced solids (screws...) share their mesh, and a fine
-            # enough existing mesh is reused instead of re-checked by the
-            # mesher (seconds on vendor CAD).
-            for piece in part.solids() or [part]:
-                if not BRepTools.Triangulation_s(piece.wrapped, tol, False):
-                    BRepMesh_IncrementalMesh(piece.wrapped, tol, False, 0.5, True)
-            stl_path = Path(td) / f"p{k}.stl"
-            writer.Write(part.wrapped, str(stl_path))
-            t, _ = _read_binary_stl(stl_path)
+            t = _mesh_triangles(part, tol, Path(td) / f"p{k}.stl")
             tri_list.append(t)
             rgb_list.append(np.broadcast_to(np.asarray(rgb, np.float32), (len(t), 3)))
     tris, base_rgb = np.concatenate(tri_list), np.concatenate(rgb_list)
