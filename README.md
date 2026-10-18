@@ -39,6 +39,7 @@ forward briefly. Run `check_permissions` once at the start.
 | `run_model_file` | Build from a script file (versionable), with `load_cad` (cached vendor CAD), `include`, `export_part`, checked `cut`/`fuse` |
 | `detect_clash` | Mesh-based pairwise interference check (seconds, also for vendor assemblies); names assembly parts, separates `expected` overlaps (threads, hoses), reports `near_miss_mm` gaps |
 | `mass_properties` | Mass, centre of gravity and inertia per labelled part and in total, from per-part materials or catalogue masses; optional robot payload check (e.g. `robot="UR10e"`) |
+| `analyse_frame` | Beam FE of welded tube frames (robot stands, carts): EN 10219 sections, automatic joints, load cases and UR-style direction envelopes; returns max von Mises stress and critical member, nodal stiffness per DOF, eigenfrequencies and PNG plots |
 | `query_features` | Cylinders (hole/boss, radius, axis, length) and planes of a part or region - read real dimensions off vendor CAD |
 | `section_view` | 2-D cross-section PNG on XY/XZ/YZ, parts coloured, areas listed |
 | `quick_look` | One progress sheet: coloured iso + front render and a section, for showing the user as you go |
