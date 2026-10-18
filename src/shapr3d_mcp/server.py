@@ -707,47 +707,89 @@ def _versioned_copy(src: Path, version: int) -> Path:
     return out
 
 
+REPLACE_ATTEMPTS = 3   # reset + select + look for Delete, this many times
+
+
+def _sidebar_visible(items: list[dict]) -> bool:
+    edge = macos.sidebar_max_x(items)
+    return any(i["text"].strip() == "Items" and i["x"] < edge for i in items)
+
+
+def _reset_ui(shot: Path) -> list[dict]:
+    """Put Shapr3D back in its idle state before touching the Items list:
+    with a tool open (Move/Rotate...) the right panel shows the tool, not
+    the selection's Delete button. Escape twice - the first leaves the
+    tool, the second drops the selection - then wait for the Items sidebar.
+    Returns the last OCR'd screen."""
+    macos.activate()
+    for _ in range(2):
+        macos.keys("escape")
+        time.sleep(0.3)
+    items: list[dict] = []
+    for _ in range(4):  # the sidebar comes back a moment after the tool closes
+        _, items = macos.read_ui(shot)
+        if _sidebar_visible(items):
+            break
+        time.sleep(0.5)
+    return items
+
+
 def _replace_previous(prev_name: str, expected: set[int]) -> dict:
     """Delete the item `prev_name` (the previous import) from the open
     project if it can be identified unambiguously (see open_in_shapr3d's
     `replace`). A fully visible versioned name is proof enough; an
-    unversioned or truncated name must also match the expected body count."""
+    unversioned or truncated name must also match the expected body count.
+    Each attempt resets the UI first (an active tool or leftover selection
+    hides the Delete button), up to REPLACE_ATTEMPTS times."""
     shot = WORKDIR / "_shapr3d_ui.png"
-    _, items = macos.read_ui(shot)
-    rows = macos.item_rows(items)
-    if not rows:
-        return {"deleted": [], "note": "Items sidebar not visible; previous version (if any) left in place."}
-    matches = [r for r in rows if macos.name_matches(r, prev_name)]
-    if not matches:
-        return {"deleted": [], "note": ""}  # new model / already gone: just add it
-    if len(matches) > 1:
-        return {"deleted": [], "note": (
-            f"{len(matches)} items look like '{prev_name}' "
-            f"({', '.join(m['text'] for m in matches)}); left them all in place.")}
-    row = matches[0]
-    exact = not row["truncated"] and bool(re.search(r"_v\d+$", prev_name))
-    macos.activate()
-    macos.click_screen(row["screen_x"], row["screen_y"])
-    if not exact:
-        count = None
-        for _ in range(8):  # the "N bodies" label takes a moment on big models
+    for attempt in range(1, REPLACE_ATTEMPTS + 1):
+        items = _reset_ui(shot)
+        if not _sidebar_visible(items):
+            return {"deleted": [], "note": "Items sidebar not visible; previous version (if any) left in place."}
+        matches = [r for r in macos.item_rows(items) if macos.name_matches(r, prev_name)]
+        if not matches:
+            if attempt == 1:
+                return {"deleted": [], "note": ""}  # new model / already gone: just add it
+            # the row was there a moment ago: something else changed, don't guess
+            return {"deleted": [], "note": f"'{prev_name}' disappeared from the Items list while replacing; nothing deleted."}
+        if len(matches) > 1:
+            return {"deleted": [], "note": (
+                f"{len(matches)} items look like '{prev_name}' "
+                f"({', '.join(m['text'] for m in matches)}); left them all in place.")}
+        row = matches[0]
+        exact = not row["truncated"] and bool(re.search(r"_v\d+$", prev_name))
+        macos.click_screen(row["screen_x"], row["screen_y"])
+        if not exact:
+            count = None
+            for _ in range(8):  # the "N bodies" label takes a moment on big models
+                time.sleep(0.5)
+                _, items = macos.read_ui(shot)
+                count = macos.selected_body_count(items)
+                if count is not None:
+                    break
+            if count is None and attempt < REPLACE_ATTEMPTS:
+                continue  # selection didn't take (tool still active?): reset, retry
+            if not macos.body_count_close(count, expected):
+                macos.keys("escape")
+                return {"deleted": [], "note": (
+                    f"'{row['name']}' has {count} bodies, expected {sorted(expected)}; "
+                    "not sure it's the previous version, so it was left in place.")}
+            delete = macos.match_text("Delete", items)
+        else:
+            delete = None
+        for _ in range(3):  # the selection panel takes a moment to show
+            if delete:
+                break
             time.sleep(0.5)
             _, items = macos.read_ui(shot)
-            count = macos.selected_body_count(items)
-            if count is not None:
-                break
-        if not macos.body_count_close(count, expected):
-            macos.keys("escape")
-            return {"deleted": [], "note": (
-                f"'{row['name']}' has {count} bodies, expected {sorted(expected)}; "
-                "not sure it's the previous version, so it was left in place.")}
+            delete = macos.match_text("Delete", items)
+        if delete:
+            break
     else:
-        time.sleep(0.5)
-        _, items = macos.read_ui(shot)
-    delete = macos.match_text("Delete", items)
-    if not delete:
         macos.keys("escape")
-        return {"deleted": [], "note": "Delete button not found; previous version left in place."}
+        return {"deleted": [], "note": (
+            f"Delete button not found after {REPLACE_ATTEMPTS} attempts; "
+            "previous version left in place.")}
     macos.click_screen(delete["screen_x"], delete["screen_y"])
     for _ in range(6):  # the sidebar takes a moment to drop the row
         time.sleep(0.6)
@@ -766,10 +808,7 @@ def _sidebar_rows() -> list[dict] | None:
         _, items = macos.read_ui(WORKDIR / "_shapr3d_ui.png")
     except Exception:
         return None
-    rows = macos.item_rows(items)
-    edge = macos.sidebar_max_x(items)
-    has_sidebar = any(i["text"].strip() == "Items" and i["x"] < edge for i in items)
-    return rows if has_sidebar else None
+    return macos.item_rows(items) if _sidebar_visible(items) else None
 
 
 IMPORT_CONFIRM_S = 180.0   # big vendor STEPs take a minute or two to appear
