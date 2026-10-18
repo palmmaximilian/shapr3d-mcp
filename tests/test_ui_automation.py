@@ -161,6 +161,8 @@ def fake_import(monkeypatch):
     monkeypatch.setattr(server, "_osascript", lambda sc: scripts.append(sc) or "")
     monkeypatch.setattr(server, "_shapr3d_history_mentions", lambda needle: True)
     monkeypatch.setattr(macos, "read_ui", lambda out: (WIN, []))  # no sidebar
+    monkeypatch.setattr(macos, "activate", lambda: None)  # never key the real app
+    monkeypatch.setattr(macos, "keys", lambda c: None)
     server.create_model("iterate_me", "result = Box(5, 5, 5)")
     return scripts
 
@@ -333,7 +335,8 @@ def test_reimport_keeps_item_with_other_body_count(screens):
     other = SELECTED[:-2] + [row("7 bodies", 328, 270), row("Delete", 779, 270)]
     screens["screens"] = [SIDEBAR + [OLD], other, SIDEBAR + [OLD], SIDEBAR + [OLD, NEW]]
     msg = server.open_in_shapr3d("iterate_me.step", versioned=False)
-    assert len(screens["clicks"]) == 1 and screens["keys"] == ["escape"]
+    # reset (escape x2) before selecting, escape again to drop the selection
+    assert len(screens["clicks"]) == 1 and screens["keys"] == ["escape"] * 3
     assert "7 bodies" in msg and "left in place" in msg
 
 
@@ -355,7 +358,7 @@ def test_failed_import_restores_deleted_version(screens, fake_import):
     screens["screens"] = [SIDEBAR + [OLD], SELECTED, SIDEBAR]  # nothing arrives
     with pytest.raises(RuntimeError, match="restored"):
         server.open_in_shapr3d("iterate_me.step", versioned=False)
-    assert screens["keys"] == ["cmd+z"]
+    assert screens["keys"] == ["escape", "escape", "cmd+z"]
     assert len(fake_import) == 1  # never re-imported: a slow import would duplicate
 
 
@@ -388,6 +391,66 @@ def test_first_versioned_import_checks_legacy_item_body_count(screens, fake_impo
     msg = server.open_in_shapr3d("iterate_me.step")
     assert "iterate_me_v1.step" in fake_import[0]
     assert "left in place" in msg
+
+
+def test_replace_leaves_active_tool_before_selecting(screens, fake_import, monkeypatch):
+    # Move/Rotate active: escape twice before the first click, so the
+    # selection panel (with Delete) shows instead of the tool's panel
+    order = []
+    screens_keys, screens_clicks = screens["keys"], screens["clicks"]
+    monkeypatch.setattr(macos, "keys", lambda c: (screens_keys.append(c), order.append(("key", c))))
+    monkeypatch.setattr(macos, "click_screen",
+                        lambda x, y: (screens_clicks.append((x, y)), order.append(("click", y))))
+    screens["screens"] = [SIDEBAR + [OLD], SELECTED, SIDEBAR, SIDEBAR, SIDEBAR + [NEW]]
+    msg = server.open_in_shapr3d("iterate_me.step", versioned=False)
+    assert order[:3] == [("key", "escape"), ("key", "escape"), ("click", OLD["screen_y"])]
+    assert "Replaced the previous version" in msg
+
+
+def test_replace_retries_when_delete_button_missing(screens, fake_import):
+    # first attempt: the tool panel hides Delete -> reset and select again
+    server.IMPORTS_MANIFEST.write_text('{"iterate_me": {"bodies": 1, "version": 1}}')
+    v1, v2 = row("› O iterate_me_v1", 147), row("› O iterate_me_v2", 147)
+    tool_panel = SIDEBAR + [v1, row("Move/Rotate", 400, 270)]
+    sel = SIDEBAR + [v1, row("Delete", 779, 270)]
+    screens["screens"] = ([SIDEBAR + [v1]] + [tool_panel] * 3   # attempt 1
+                          + [SIDEBAR + [v1], sel]               # attempt 2
+                          + [SIDEBAR, SIDEBAR, SIDEBAR + [v2]])
+    msg = server.open_in_shapr3d("iterate_me.step")
+    v1_click = (v1["screen_x"], v1["screen_y"])
+    assert screens["clicks"] == [v1_click, v1_click, (320, 779 + 34)]
+    assert screens["keys"] == ["escape"] * 4  # two resets, no stray escapes
+    assert "Replaced the previous version (iterate_me_v1)" in msg
+
+
+def test_replace_gives_up_after_bounded_attempts(screens, fake_import):
+    server.IMPORTS_MANIFEST.write_text('{"iterate_me": {"bodies": 1, "version": 1}}')
+    v1, v2 = row("› O iterate_me_v1", 147), row("› O iterate_me_v2", 171)
+    tool_panel = SIDEBAR + [v1, row("Move/Rotate", 400, 270)]
+    screens["screens"] = [tool_panel] * (server.REPLACE_ATTEMPTS * 4 + 1) + [SIDEBAR + [v1, v2]]
+    msg = server.open_in_shapr3d("iterate_me.step")
+    assert len(screens["clicks"]) == server.REPLACE_ATTEMPTS  # only ever the row, never Delete
+    assert screens["keys"] == ["escape"] * (2 * server.REPLACE_ATTEMPTS + 1)
+    assert f"Delete button not found after {server.REPLACE_ATTEMPTS} attempts" in msg
+
+
+def test_replace_waits_for_sidebar_after_reset(screens, fake_import):
+    # right after a previous import / closing a tool the sidebar may lag
+    server.IMPORTS_MANIFEST.write_text('{"iterate_me": {"bodies": 1, "version": 1}}')
+    v1, v2 = row("› O iterate_me_v1", 147), row("› O iterate_me_v2", 147)
+    sel = SIDEBAR + [v1, row("Delete", 779, 270)]
+    screens["screens"] = [[], [], SIDEBAR + [v1], sel, SIDEBAR, SIDEBAR, SIDEBAR + [v2]]
+    msg = server.open_in_shapr3d("iterate_me.step")
+    assert "Replaced the previous version (iterate_me_v1)" in msg
+
+
+def test_replace_never_deletes_when_row_vanishes_between_attempts(screens, fake_import):
+    server.IMPORTS_MANIFEST.write_text('{"iterate_me": {"bodies": 1, "version": 1}}')
+    v1, v2 = row("› O iterate_me_v1", 147), row("› O iterate_me_v2", 147)
+    tool_panel = SIDEBAR + [v1, row("Move/Rotate", 400, 270)]
+    screens["screens"] = [SIDEBAR + [v1]] + [tool_panel] * 3 + [SIDEBAR, SIDEBAR, SIDEBAR + [v2]]
+    msg = server.open_in_shapr3d("iterate_me.step")
+    assert len(screens["clicks"]) == 1 and "disappeared" in msg
 
 
 def test_body_count_tolerance():
