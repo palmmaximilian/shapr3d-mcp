@@ -71,6 +71,7 @@ WORKDIR.mkdir(parents=True, exist_ok=True)
 
 APP_NAME = "Shapr3D"
 IMPORT_FORMATS = {".step", ".stp", ".stl", ".brep", ".iges", ".igs"}
+MESH_IMPORT_SUFFIXES = {".stl"}   # these open the "Import Preferences" sheet
 
 IS_WINDOWS = sys.platform == "win32"
 # On Windows, Shapr3D is a Microsoft Store (MSIX) app: no install folder to
@@ -2274,6 +2275,8 @@ def open_in_shapr3d(path: str, new_project: bool | None = None,
     attempts = 0
     for attempts in (1,):  # no automatic retry: a slow import + retry = duplicate
         _attempt()
+        if sys.platform == "darwin" and src.suffix.lower() in MESH_IMPORT_SUFFIXES:
+            _accept_import_preferences()
         # big STEP files (vendor CAD, 100+ bodies) take a minute to appear
         confirmed = False
         deadline = time.monotonic() + IMPORT_CONFIRM_S   # wall clock: History
@@ -2313,6 +2316,29 @@ def open_in_shapr3d(path: str, new_project: bool | None = None,
         + (" The previous version that was deleted first has been restored "
            "(Cmd+Z)." if replaced["deleted"] else "")
     )
+
+
+def _accept_import_preferences(timeout_s: float = 20.0) -> bool:
+    """Mesh files (STL) open Shapr3D's "Import Preferences" sheet (unit, mesh
+    repair) before anything is imported; it waits for a click on Import.
+    Keep its defaults (mm, repair on) and press Import. Returns False when the
+    sheet never showed up (older Shapr3D versions import straight away)."""
+    shot = WORKDIR / "_shapr3d_ui.png"
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            _, items = macos.read_ui(shot)
+        except Exception:
+            items = []
+        if macos.match_text("Import Preferences", items):
+            button = [i for i in items if i["text"].strip().lower() == "import"]
+            if button:
+                b = max(button, key=lambda i: i["y"])  # the button sits below the title
+                macos.activate()
+                macos.click_screen(b["screen_x"], b["screen_y"])
+                return True
+        time.sleep(0.8)
+    return False
 
 
 @mcp.tool()
