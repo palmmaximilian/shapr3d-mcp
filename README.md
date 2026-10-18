@@ -133,6 +133,32 @@ small script (`import_step`, keep the solids you need, `export_brep`) and
 `load_cad` that in the assembly script. A 240-solid gripper-beam assembly
 built that way takes about 12 s, and its `quick_look` about 5 s.
 
+### UR robot cells
+
+Tools for placing a Universal Robots arm (UR3e, UR5e, UR10e, UR12e, UR16e,
+UR20; official DH values) and checking a cell or robot cart. Inputs are
+plain JSON in mm / degrees / kg; the code lives in `src/shapr3d_mcp/robots/`
+and works without MCP too.
+
+| Tool | Purpose |
+|---|---|
+| `ur_kinematics` | FK (flange, TCP, joint origins) for `q_deg`, or all 8 analytic IK solutions for a TCP pose |
+| `ur_reach_check` | Every target reachable without collision? IK x sampled tool spin/tilt; links and tool are capsules, obstacles are boxes; returns the best `q_deg` per target |
+| `ur_base_search` | Grid search over base positions / yaw / lean for bases that reach all targets, best clearance first |
+| `ur_pose_step` | Pose the vendor UR STEP (from universal-robots.com) at `q_deg`, mount a tool, export the assembly; links are detected from the home pose or given as `link_map` |
+| `ur_collision_check` | Real-CAD check: posed robot + tool vs. environment STEP files, interference volume per robot part and pose |
+| `cart_tipping` | Tipping of a cart on castors: hand force on the tool, robot accelerations (program / stop), manual transport (push force, sudden stop, wheel blocked at speed, slope, thresholds with castor trail) |
+
+Typical flow: `ur_reach_check` with section-cut boxes of the machine ->
+`ur_base_search` if targets fail -> `ur_collision_check` on the tightest
+`poses_q_deg` against the real CAD -> `cart_tipping` with the cart masses
+(e.g. from `mass_properties`) and the same poses. Poses are `{"xyz",
+"rpy_deg"}` (R = Rz Ry Rx), `{"xyz", "rotvec"}` (UR pendant) or 4x4
+matrices; a base `{"xyz", "yaw_deg": -90}` points the cable outlet (base
++y) to world +X. The capsule model is measured on the UR16e (shared by
+the UR10e/UR12e) and scaled for the other models, so confirm close calls
+with `ur_collision_check`.
+
 ### Windows notes
 
 Shapr3D for Windows is a Store app, which only accepts `.shapr` files from

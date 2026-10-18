@@ -2715,6 +2715,16 @@ diff_models (what the user changed after editing in Shapr3D).
 """
 
 
+# ---------------------------------------------------------------------------
+# UR robot tools
+# ---------------------------------------------------------------------------
+# ur_kinematics, ur_reach_check, ur_base_search, ur_pose_step,
+# ur_collision_check, cart_tipping: defined in robots/tools.py, registered
+# on `mcp` when imported here (after _heavy_tool and the helpers exist).
+
+from shapr3d_mcp.robots import tools as _robot_tools  # noqa: E402,F401
+
+
 def _preload_native_modules() -> None:
     """Import every native-extension module the tools use, before serving.
 
