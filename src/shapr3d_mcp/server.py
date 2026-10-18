@@ -1519,6 +1519,58 @@ def create_drawing(path: str, title: str = "", drawing_no: str = "", material: s
 
 
 @_heavy_tool
+def analyse_frame(members: list[dict], supports: list, loads: list[dict] | None = None,
+                  sweeps: list[dict] | None = None, masses: list[dict] | None = None,
+                  probes: list[dict] | None = None, n_modes: int = 3,
+                  name: str = "frame", plots: bool = True,
+                  max_element_mm: float = 120.0, fy_mpa: float = 235.0) -> dict:
+    """Beam FE check of a welded tube frame (robot stand, cart, rack):
+    stresses, nodal stiffness and eigenfrequencies. 3D Euler-Bernoulli beams
+    on the member centre lines, EN 10219 hollow sections, steel S235 by
+    default; joints are found automatically (each member end attaches to the
+    nearest member within the half-widths + 5 mm by a rigid offset link).
+    Frame-only: floor, castor and weld compliance are NOT included.
+
+    Args:
+        members: [{name, p0: [x,y,z], p1, section}] in mm. section [w, t]
+            square tube, [b, h, t] rectangular (b = horizontal width of a
+            horizontal member; for vertical members b lies along world Y),
+            or "rigid" for stiff massless links (base plates, adapter stubs).
+        supports: points [x,y,z] (pinned) or {point, fix: "xyz"|"all"}.
+            Need >= 3 non-collinear pins or one clamp.
+        loads: [{point, F: [N]*3, M: [Nm]*3, case?, name?}]; loads with the
+            same case act together.
+        sweeps: direction envelopes like the UR manual "Dimensioning the
+            stand" (values already including its safety factor), e.g.
+            {point: <robot base>, Fxy: 1330, Fz: 1870, Mxy: 1320, Mz: 990,
+            case: "stop", name: "base"} - N and Nm; Fxy/Mxy rotated in
+            step_deg (30) steps independently, Fz/Mz with both signs.
+        masses: [{point, kg, name?}] lumped masses (robot, controller) for the
+            eigenfrequencies; tube self-mass is included automatically.
+        probes: [{point, name}] extra points for nodal stiffness.
+        Points not on a member are tied to the nearest one by a rigid link.
+        n_modes: eigenfrequencies to return (Guyan-condensed).
+        name: output folder (in the workspace) for the PNG plots.
+        fy_mpa: yield strength for the utilisation figure.
+    Returns max von Mises stress with case and critical member, per-case
+    envelopes and displacements, stiffness per DOF at every load/probe point
+    (N/mm, kNm/rad), eigenfrequencies in Hz and the PNG plot paths (stress
+    colour map, exaggerated deformation, mode shapes) - show them.
+    """
+    from . import frame_fe
+    spec = {"members": members, "supports": supports, "loads": loads or [],
+            "sweeps": sweeps or [], "masses": masses or [], "probes": probes or [],
+            "max_element_mm": max_element_mm, "material": {"fy": fy_mpa}}
+    R = frame_fe.analyse(spec, n_modes=n_modes)
+    out = frame_fe.summary(R)
+    if plots:
+        out["plots"] = frame_fe.plot_all(R, _out_base(name), "frame")
+    out["assumptions"] = ("Frame only: rigid joints, nominal box-section von Mises, "
+                          "no floor/castor/weld compliance, no buckling check.")
+    return out
+
+
+@_heavy_tool
 def quick_look(path: str, include: list[str] | None = None,
                exclude: list[str] | None = None, plane: str = "XZ",
                offset: float = 0.0) -> dict:
